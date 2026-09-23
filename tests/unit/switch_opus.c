@@ -48,6 +48,61 @@ static char *opus_test_sdp(switch_core_session_t *session, int rate, const char 
 			port, rate, *fmtp ? "a=fmtp:111 " : "", fmtp, *fmtp ? "\r\n" : "");
 }
 
+/* Loopback RTP session paired with a plain UDP peer socket, for RFC 4733 checks. */
+static switch_rtp_t *dtmf_test_rtp(switch_memory_pool_t *pool, uint32_t samples_per_interval,
+			switch_socket_t **peer, switch_sockaddr_t **rtp_addr)
+{
+	switch_rtp_flag_t flags[SWITCH_RTP_FLAG_INVALID] = { 0 };
+	switch_sockaddr_t *peer_addr;
+	switch_port_t rtp_port = switch_rtp_request_port("127.0.0.1");
+	const char *err = NULL;
+	switch_rtp_t *rtp;
+
+	if (switch_sockaddr_info_get(&peer_addr, "127.0.0.1", SWITCH_INET, 0, 0, pool) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_create(peer, SWITCH_INET, SOCK_DGRAM, SWITCH_PROTO_UDP, pool) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_bind(*peer, peer_addr) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_addr_get(&peer_addr, SWITCH_FALSE, *peer) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_timeout_set(*peer, 5000) != SWITCH_STATUS_SUCCESS ||
+		switch_sockaddr_info_get(rtp_addr, "127.0.0.1", SWITCH_INET, rtp_port, 0, pool) != SWITCH_STATUS_SUCCESS) {
+		return NULL;
+	}
+
+	flags[SWITCH_RTP_FLAG_USE_TIMER] = 1;
+	rtp = switch_rtp_new("127.0.0.1", rtp_port, "127.0.0.1", switch_sockaddr_get_port(peer_addr), 111,
+			samples_per_interval, 20000, flags, "soft", &err, pool, 0, 0);
+	if (rtp) {
+		switch_rtp_set_telephony_event(rtp, 101);
+		switch_rtp_set_telephony_recv_event(rtp, 101);
+	}
+	return rtp;
+}
+
+static void dtmf_test_read(switch_rtp_t *rtp)
+{
+	switch_frame_t frame = { 0 };
+	switch_rtp_zerocopy_read_frame(rtp, &frame, SWITCH_IO_FLAG_NONE);
+}
+
+static void dtmf_test_send_event(switch_socket_t *peer, switch_sockaddr_t *rtp_addr, uint16_t seq, uint32_t ts,
+			int marker, int end, uint16_t duration)
+{
+	unsigned char packet[16] = { 0x80 };
+	switch_size_t len = sizeof(packet);
+	uint32_t ssrc = htonl(0x12345678);
+
+	packet[1] = (marker ? 0x80 : 0) | 101;
+	packet[2] = seq >> 8;
+	packet[3] = seq & 0xff;
+	ts = htonl(ts);
+	memcpy(packet + 4, &ts, 4);
+	memcpy(packet + 8, &ssrc, 4);
+	packet[12] = 5; /* digit '5' */
+	packet[13] = (end ? 0x80 : 0) | 10;
+	packet[14] = duration >> 8;
+	packet[15] = duration & 0xff;
+	switch_socket_sendto(peer, rtp_addr, 0, (void *) packet, &len);
+}
+
 static switch_status_t opus_test_write_rtp(switch_core_session_t *session, switch_frame_t *frame,
 			switch_io_flag_t flags, int stream_id)
 {
@@ -229,6 +284,80 @@ FST_CORE_BEGIN("./conf")
 				switch_core_codec_destroy(&pcm);
 				opus_test_close(&session);
 				switch_socket_close(receiver);
+			}
+		}
+		FST_TEST_END()
+
+		FST_TEST_BEGIN(test_rfc2833_rtp_clock)
+		{
+			/* switch_dtmf_t.duration is in 8 kHz samples; RFC 4733 durations on the wire
+			 * run at the RTP clock (48 kHz for Opus). A 250 ms digit must span ~250 ms of
+			 * RTP clock when sent, and a 200 ms received event must be 1600 core samples. */
+			uint32_t intervals[] = { 160, 960 };
+			unsigned int r;
+			for (r = 0; r < sizeof(intervals) / sizeof(intervals[0]); r++) {
+				uint32_t spi = intervals[r], rate = spi * 50;
+				switch_core_session_t *session = NULL;
+				switch_call_cause_t cause;
+				switch_socket_t *peer = NULL;
+				switch_sockaddr_t *rtp_addr = NULL;
+				switch_rtp_t *rtp;
+				switch_dtmf_t dtmf = { '5', 2000, 0, 0 };
+				uint32_t last_duration = 0, packets = 0, expected_rx = 1600;
+				int loops, end = 0;
+				uint16_t seq = 100;
+
+				/* The RTP session finds its core session through the memory pool. */
+				fst_requires(switch_ivr_originate(NULL, &session, &cause, "null/dtmf-test", 2,
+						NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, NULL) == SWITCH_STATUS_SUCCESS);
+				rtp = dtmf_test_rtp(switch_core_session_get_pool(session), spi, &peer, &rtp_addr);
+				fst_requires(rtp != NULL);
+
+				fst_requires(switch_rtp_queue_rfc2833(rtp, &dtmf) == SWITCH_STATUS_SUCCESS);
+				for (loops = 0; loops < 60 && !end; loops++) {
+					unsigned char received[256];
+					switch_size_t len = sizeof(received);
+					switch_sockaddr_t *from;
+
+					dtmf_test_read(rtp);
+					switch_sockaddr_info_get(&from, "127.0.0.1", SWITCH_INET, 0, 0, fst_pool);
+					while (!end && switch_socket_recvfrom(from, peer, 0, (char *) received, &len) == SWITCH_STATUS_SUCCESS && len) {
+						if (len >= 16 && (received[1] & 0x7f) == 101) {
+							uint32_t duration = (received[14] << 8) | received[15];
+							if (packets && !(received[13] & 0x80)) {
+								fst_xcheck(duration - last_duration == spi,
+									switch_core_sprintf(fst_pool, "%u Hz: duration step %u, expected %u", rate, duration - last_duration, spi));
+							}
+							last_duration = duration;
+							end = received[13] & 0x80;
+							packets++;
+						}
+						len = sizeof(received);
+					}
+				}
+				fst_xcheck(end && last_duration >= rate / 4 && last_duration < rate / 4 + spi,
+					switch_core_sprintf(fst_pool, "%u Hz: 250 ms digit ended at duration %u, expected %u", rate, last_duration, rate / 4));
+
+				/* 200 ms event from the peer, durations stepping at the RTP clock */
+				for (loops = 1; loops <= 10; loops++) {
+					dtmf_test_send_event(peer, rtp_addr, seq++, 5000, loops == 1, 0, (uint16_t) (loops * spi));
+				}
+				for (loops = 0; loops < 3; loops++) {
+					dtmf_test_send_event(peer, rtp_addr, seq++, 5000, 0, 1, (uint16_t) (10 * spi));
+				}
+				for (loops = 0; loops < 50 && !switch_rtp_has_dtmf(rtp); loops++) {
+					dtmf_test_read(rtp);
+				}
+				memset(&dtmf, 0, sizeof(dtmf));
+				fst_check(switch_rtp_dequeue_dtmf(rtp, &dtmf) == 1);
+				fst_check(dtmf.digit == '5');
+				fst_xcheck(dtmf.duration == expected_rx,
+					switch_core_sprintf(fst_pool, "%u Hz: received 200 ms digit as %u core samples, expected %u", rate, dtmf.duration, expected_rx));
+
+				switch_rtp_destroy(&rtp);
+				switch_socket_close(peer);
+				switch_channel_hangup(switch_core_session_get_channel(session), SWITCH_CAUSE_NORMAL_CLEARING);
+				switch_core_session_rwunlock(session);
 			}
 		}
 		FST_TEST_END()

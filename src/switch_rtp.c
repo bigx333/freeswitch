@@ -540,6 +540,25 @@ typedef enum {
 
 static void do_2833(switch_rtp_t *rtp_session);
 
+/* switch_dtmf_t.duration is in 8 kHz samples, while RFC 4733 event durations (and the event
+   timestamps, which share the audio stream) run at the RTP clock, e.g. 48 kHz for Opus. */
+#define DTMF_CORE_RATE 8000
+
+static uint32_t dtmf_rtp_rate(switch_rtp_t *rtp_session)
+{
+	return rtp_session->samples_per_second ? rtp_session->samples_per_second : DTMF_CORE_RATE;
+}
+
+static uint32_t dtmf_duration_to_rtp(switch_rtp_t *rtp_session, uint32_t duration)
+{
+	return (uint32_t) ((uint64_t) duration * dtmf_rtp_rate(rtp_session) / DTMF_CORE_RATE);
+}
+
+static uint32_t dtmf_duration_from_rtp(switch_rtp_t *rtp_session, uint32_t duration)
+{
+	return (uint32_t) ((uint64_t) duration * DTMF_CORE_RATE / dtmf_rtp_rate(rtp_session));
+}
+
 
 #define rtp_type(rtp_session) rtp_session->flags[SWITCH_RTP_FLAG_TEXT] ?  "text" : (rtp_session->flags[SWITCH_RTP_FLAG_VIDEO] ? "video" : "audio")
 
@@ -744,6 +763,8 @@ static handle_rfc2833_result_t handle_rfc2833(switch_rtp_t *rtp_session, switch_
 						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "you're welcome!\n");
 #endif
 					}
+
+					dtmf.duration = dtmf_duration_from_rtp(rtp_session, dtmf.duration);
 #ifdef DEBUG_2833
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "done digit=%c ts=%u start_ts=%u dur=%u ddur=%u\n",
 						   dtmf.digit, ts, rtp_session->dtmf_data.in_digit_ts, duration, dtmf.duration);
@@ -5598,7 +5619,7 @@ static void do_2833(switch_rtp_t *rtp_session)
 			memset(rtp_session->dtmf_data.out_digit_packet, 0, 4);
 			rtp_session->dtmf_data.out_digit_sofar = samples;
 			rtp_session->dtmf_data.out_digit_sub_sofar = samples;
-			rtp_session->dtmf_data.out_digit_dur = rdigit->duration;
+			rtp_session->dtmf_data.out_digit_dur = dtmf_duration_to_rtp(rtp_session, rdigit->duration);
 			rtp_session->dtmf_data.out_digit = rdigit->digit;
 			rtp_session->dtmf_data.out_digit_packet[0] = (unsigned char) switch_char_to_rfc2833(rdigit->digit);
 			rtp_session->dtmf_data.out_digit_packet[1] = 13;

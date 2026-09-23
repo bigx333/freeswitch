@@ -1127,9 +1127,8 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_send_dtmf_string(switch_core
 	int i, argc;
 	char *argv[256];
 	int dur_total = 0;
+	/* switch_dtmf_t.duration is in 8 kHz samples; the RTP layer converts to the RTP clock */
 	int rate_mult = 8;
-
-	switch_codec_implementation_t write_impl = { 0 };
 
 	switch_assert(session != NULL);
 
@@ -1158,12 +1157,6 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_send_dtmf_string(switch_core
 	if (argc) {
 		switch_channel_pre_answer(session->channel);
 	}
-
-	switch_core_session_get_write_impl(session, &write_impl);
-
-	if (write_impl.actual_samples_per_second >= 1000) {
-		rate_mult = (write_impl.actual_samples_per_second / 1000);
-	} 
 
 	for (i = 0; i < argc; i++) {
 		dtmf.duration = switch_core_default_dtmf_duration(0);
