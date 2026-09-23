@@ -3711,11 +3711,21 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_set_codec(switch_core_session_
 	switch_core_session_set_write_impl(session, a_engine->write_codec.implementation);
 
 	if (switch_rtp_ready(a_engine->rtp_session)) {
+		uint32_t samples_per_interval = a_engine->read_impl.samples_per_packet;
+
 		switch_assert(a_engine->read_codec.implementation);
+
+		/* RFC 7587: Opus uses a 48 kHz RTP clock at every PCM rate. Mirror
+		 * RTP initialization when changing the interval after negotiation;
+		 * samples_per_packet must remain the actual PCM frame size. */
+		if (!strcasecmp("opus", a_engine->read_impl.iananame)) {
+			samples_per_interval = a_engine->read_impl.samples_per_second *
+					(a_engine->read_impl.microseconds_per_packet / 1000) / 1000;
+		}
 
 		if (switch_rtp_change_interval(a_engine->rtp_session,
 									   a_engine->read_impl.microseconds_per_packet,
-									   a_engine->read_impl.samples_per_packet) != SWITCH_STATUS_SUCCESS) {
+									   samples_per_interval) != SWITCH_STATUS_SUCCESS) {
 			switch_channel_hangup(session->channel, SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER);
 			switch_goto_status(SWITCH_STATUS_FALSE, end);
 		}
@@ -5528,6 +5538,17 @@ SWITCH_DECLARE(uint8_t) switch_core_media_negotiate_sdp(switch_core_session_t *s
 									  imp->iananame, imp->ianacode, codec_rate, imp->microseconds_per_packet / 1000, bit_rate, imp->number_of_channels);
 					if ((zstr(map->rm_encoding) || (smh->mparams->ndlb & SM_NDLB_ALLOW_BAD_IANANAME)) && map->rm_pt < 96) {
 						match = (map->rm_pt == imp->ianacode) ? 1 : 0;
+					} else if (!strcasecmp(rm_encoding, "opus")) {
+						/* Opus fmtp playback/capture rates describe independent directions,
+						 * not codec compatibility. Keep local PCM preferences and match
+						 * the RTP clock. Also accept legacy actual-rate RTP maps, but only
+						 * for a locally allowed implementation at that rate. */
+						match = (!strcasecmp(imp->iananame, "opus") && map->rm_pt > 95 && imp->ianacode > 95 &&
+								 (map->rm_rate == codec_rate || map->rm_rate == imp->actual_samples_per_second));
+						if (match) {
+							/* Do not demote a compatible Opus implementation to a near-match. */
+							remote_codec_rate = codec_rate;
+						}
 					} else {
 						match = (!strcasecmp(rm_encoding, imp->iananame) &&
 								 ((map->rm_pt < 96 && imp->ianacode < 96) || (map->rm_pt > 95 && imp->ianacode > 95)) &&
@@ -16201,7 +16222,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_write_frame(switch_core_sess
 				session->enc_write_frame.codec = session->write_codec;
 				session->enc_write_frame.samples = enc_frame->datalen / sizeof(int16_t) / session->write_impl.number_of_channels;
 				session->enc_write_frame.channels = session->write_impl.number_of_channels;
-				if (frame->codec->implementation->samples_per_packet != session->write_impl.samples_per_packet) {
+				if (frame->codec->implementation->samples_per_packet != session->write_impl.samples_per_packet ||
+					frame->codec->implementation->samples_per_second != session->write_impl.samples_per_second) {
+					/* Equal PCM frame sizes do not imply equal RTP clocks (e.g. L16
+					 * and Opus at 16 kHz). Regenerate timestamps at the write clock. */
 					session->enc_write_frame.timestamp = 0;
 				} else {
 					session->enc_write_frame.timestamp = frame->timestamp;
