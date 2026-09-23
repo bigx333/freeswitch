@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release
+
+# swclt_test needs live SignalWire cloud credentials; skip it
+override_dh_auto_test:
+
+# cmake writes changelog.Debian to the source dir (its gzip step only
+# works for in-source builds) but installs it from the build dir
+override_dh_auto_install:
+	gzip -f -9 -n changelog.Debian
+	cp changelog.Debian.gz copyright obj-$(DEB_HOST_GNU_TYPE)/
+	dh_auto_install

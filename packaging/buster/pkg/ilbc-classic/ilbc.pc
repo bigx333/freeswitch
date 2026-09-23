@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${prefix}/lib/x86_64-linux-gnu
+includedir=${prefix}/include
+
+Name: ilbc
+Description: iLBC audio codec library (classic API)
+Version: 0.0.1
+Libs: -L${libdir} -lilbc
+Cflags: -I${includedir}

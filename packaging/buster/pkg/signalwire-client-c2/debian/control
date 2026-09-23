@@ -1,0 +1,13 @@
+Source: signalwire-client-c2
+Section: libs
+Priority: optional
+Maintainer: Buster Rebuild <buster-rebuild@localhost>
+Build-Depends: debhelper (>= 10), cmake, pkg-config, libssl-dev, libks2
+Standards-Version: 4.3.0
+
+Package: signalwire-client-c2
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: SignalWire C client SDK (v2)
+ Shared library, headers and pkg-config file for the SignalWire
+ C client, rebuilt for Debian Buster.

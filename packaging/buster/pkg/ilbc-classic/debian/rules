@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --with autoreconf
+
+# Ship an ilbc.pc pkg-config file (upstream tree never had one);
+# FreeSWITCH configure probes the 'ilbc' name.
+override_dh_auto_install:
+	dh_auto_install
+	mkdir -p debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/pkgconfig
+	cp ilbc.pc debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/pkgconfig/ilbc.pc

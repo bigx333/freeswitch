@@ -1,0 +1,14 @@
+FreeSWITCH @PKG_VERSION@ for Debian Buster (amd64)
+Built from commit @COMMIT@ on @DATE@, with the SignalWire-only dependency debs.
+
+Verify integrity:
+  sha256sum -c SHA256SUMS
+
+Install (on a Buster host, deps first):
+  sudo dpkg -i libsofia-sip-ua0_*_amd64.deb libspandsp3_*_amd64.deb \
+    libks2_*_amd64.deb signalwire-client-c2_*_amd64.deb libilbc0_*_amd64.deb
+  sudo dpkg -i freeswitch_@PKG_VERSION@_amd64.deb <other freeswitch-*.deb as needed>
+  sudo apt-get install -f   # pull any remaining archive deps
+
+Or install everything at once:
+  sudo dpkg -i *.deb; sudo apt-get install -f

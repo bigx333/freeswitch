@@ -1,0 +1,13 @@
+Source: libks2
+Section: libs
+Priority: optional
+Maintainer: Buster Rebuild <buster-rebuild@localhost>
+Build-Depends: debhelper (>= 10), cmake, pkg-config, libssl-dev, uuid-dev
+Standards-Version: 4.3.0
+
+Package: libks2
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: SignalWire cross-platform kitchen sink library (v2)
+ Shared library, headers, pkg-config and cmake files for libks2,
+ rebuilt for Debian Buster.

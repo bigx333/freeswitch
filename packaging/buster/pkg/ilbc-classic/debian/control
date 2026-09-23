@@ -1,0 +1,22 @@
+Source: ilbc
+Section: libs
+Priority: optional
+Maintainer: Buster Rebuild <buster-rebuild@localhost>
+Build-Depends: debhelper (>= 10), dh-autoreconf, pkg-config
+Standards-Version: 4.3.0
+
+Package: libilbc0
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: iLBC audio codec library (classic API)
+ Shared library for the classic iLBC audio codec API as used by
+ FreeSWITCH mod_ilbc, rebuilt for Debian Buster from the source
+ previously carried in-tree by FreeSWITCH.
+
+Package: libilbc-dev
+Section: libdevel
+Architecture: any
+Depends: libilbc0 (= ${binary:Version}), ${misc:Depends}
+Description: iLBC audio codec library (development files)
+ Headers, pkg-config file and development files for the classic
+ iLBC audio codec API, rebuilt for Debian Buster.

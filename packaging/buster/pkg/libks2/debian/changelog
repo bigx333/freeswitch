@@ -1,0 +1,5 @@
+libks2 (2.0.5-1~buster1) buster; urgency=medium
+
+  * Rebuild for Debian Buster.
+
+ -- Buster Rebuild <buster-rebuild@localhost>  Tue, 22 Sep 2026 14:00:00 +0000

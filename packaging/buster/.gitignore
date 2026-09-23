@@ -1,0 +1,6 @@
+/.build/
+/debs/
+/dist/
+/dl/
+# Classic iLBC source (not downloadable elsewhere); the root .gitignore drops *.gz
+!/pkg/ilbc-classic/ilbc-classic.tar.gz

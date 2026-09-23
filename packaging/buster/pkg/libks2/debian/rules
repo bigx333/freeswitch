@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release
+
+# testhttp is not parallel-safe (binds fixed ports); run serially
+override_dh_auto_test:
+	dh_auto_test --no-parallel
+
+# cmake writes changelog.Debian to the source dir (its gzip step only
+# works for in-source builds) but installs it from the build dir
+override_dh_auto_install:
+	gzip -f -9 -n changelog.Debian
+	cp changelog.Debian.gz obj-$(DEB_HOST_GNU_TYPE)/
+	dh_auto_install

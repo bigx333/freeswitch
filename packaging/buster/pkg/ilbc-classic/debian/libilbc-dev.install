@@ -1,0 +1,3 @@
+usr/include
+usr/lib/*/libilbc.so
+usr/lib/*/pkgconfig
