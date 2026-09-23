@@ -89,6 +89,16 @@ avoid_mods_wheezy=(
   applications/mod_soundtouch
   formats/mod_vlc
 )
+avoid_mods_buster=(
+  # libsilk-dev is not available for Buster (was SignalWire-repo only)
+  codecs/mod_silk
+  # libbroadvoice-dev is not available for Buster (was SignalWire-repo only)
+  codecs/mod_bv
+  # libv8-6.1-dev is not available for Buster (was SignalWire-repo only)
+  languages/mod_v8
+  # vlc-nox is not available for Buster; module not needed
+  formats/mod_vlc
+)
 avoid_mods_trusty=(
   event_handlers/mod_amqp
   loggers/mod_raven
@@ -606,8 +616,6 @@ Depends: \${misc:Depends}, freeswitch (= \${binary:Version}),
  freeswitch-meta-conf (= \${binary:Version}),
  freeswitch-meta-lang (= \${binary:Version}),
  freeswitch-meta-mod-say (= \${binary:Version}),
- freeswitch-music,
- freeswitch-sounds,
  freeswitch-mod-abstraction (= \${binary:Version}),
  freeswitch-mod-avmd (= \${binary:Version}),
  freeswitch-mod-av (= \${binary:Version}),
@@ -713,7 +721,6 @@ Depends: \${misc:Depends}, freeswitch (= \${binary:Version}),
  freeswitch-mod-amr (= \${binary:Version}),
  freeswitch-mod-amrwb (= \${binary:Version}),
  freeswitch-mod-b64 (= \${binary:Version}),
- freeswitch-mod-bv (= \${binary:Version}),
  freeswitch-mod-codec2 (= \${binary:Version}),
  freeswitch-mod-dahdi-codec (= \${binary:Version}),
  freeswitch-mod-g723-1 (= \${binary:Version}),
@@ -722,7 +729,6 @@ Depends: \${misc:Depends}, freeswitch (= \${binary:Version}),
  freeswitch-mod-isac (= \${binary:Version}),
  freeswitch-mod-mp4v (= \${binary:Version}),
  freeswitch-mod-opus (= \${binary:Version}),
- freeswitch-mod-silk (= \${binary:Version}),
  freeswitch-mod-spandsp (= \${binary:Version}),
  freeswitch-mod-theora (= \${binary:Version}),
 Suggests:
@@ -740,7 +746,6 @@ Depends: \${misc:Depends}, freeswitch (= \${binary:Version}),
  freeswitch-mod-amr-dbg (= \${binary:Version}),
  freeswitch-mod-amrwb-dbg (= \${binary:Version}),
  freeswitch-mod-b64-dbg (= \${binary:Version}),
- freeswitch-mod-bv-dbg (= \${binary:Version}),
  freeswitch-mod-codec2-dbg (= \${binary:Version}),
  freeswitch-mod-dahdi-codec-dbg (= \${binary:Version}),
  freeswitch-mod-g723-1-dbg (= \${binary:Version}),
@@ -749,7 +754,6 @@ Depends: \${misc:Depends}, freeswitch (= \${binary:Version}),
  freeswitch-mod-isac-dbg (= \${binary:Version}),
  freeswitch-mod-mp4v-dbg (= \${binary:Version}),
  freeswitch-mod-opus-dbg (= \${binary:Version}),
- freeswitch-mod-silk-dbg (= \${binary:Version}),
  freeswitch-mod-spandsp-dbg (= \${binary:Version}),
  freeswitch-mod-theora-dbg (= \${binary:Version}),
 Suggests:
