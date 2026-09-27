@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-PKG_VERSION=${PKG_VERSION:-1.10.12-3~buster1}
+PKG_VERSION=${PKG_VERSION:-1.10.12-4~buster1}
 COMMIT=$(git -C "$ROOT" rev-parse --short=10 HEAD)
 if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
   echo "warning: uncommitted changes are not part of the build (building $COMMIT)" >&2

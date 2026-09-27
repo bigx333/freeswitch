@@ -125,7 +125,7 @@ COPY --from=deps /out /
 # ---------------------------------------------------------------- freeswitch
 FROM deps AS fs
 ARG NPROC
-ARG PKG_VERSION=1.10.12-3~buster1
+ARG PKG_VERSION=1.10.12-4~buster1
 ARG PKG_CHANGELOG="Rebuild for Debian Buster from the v1.10.12-opus-3064 branch"
 ENV DEB_BUILD_OPTIONS="parallel=${NPROC}"
 WORKDIR /data

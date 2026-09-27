@@ -109,12 +109,53 @@ static switch_status_t opus_test_write_rtp(switch_core_session_t *session, switc
 	return switch_core_media_write_frame(session, frame, flags, stream_id, SWITCH_MEDIA_TYPE_AUDIO);
 }
 
+/* Feed the real read/media-bug/write path the frame produced by a jitter
+ * buffer. A PLC frame may still contain stale DTMF/CNG bytes, not Opus audio. */
+typedef struct {
+	switch_frame_t input;
+	unsigned int recorded_bytes;
+	unsigned int replacements;
+	unsigned int replacement_plc;
+} opus_plc_test_t;
+
+static switch_status_t opus_plc_read(switch_core_session_t *session, switch_frame_t **frame,
+			switch_io_flag_t flags, int stream_id)
+{
+	opus_plc_test_t *test = switch_channel_get_private(switch_core_session_get_channel(session), "opus-plc-test");
+	*frame = &test->input;
+	return SWITCH_STATUS_SUCCESS;
+}
+
+static switch_bool_t opus_plc_bug(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type)
+{
+	opus_plc_test_t *test = user_data;
+
+	if (type == SWITCH_ABC_TYPE_READ) {
+		unsigned char data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+		switch_frame_t frame = { 0 };
+		frame.data = data;
+		frame.buflen = sizeof(data);
+		if (switch_core_media_bug_read(bug, &frame, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS) {
+			test->recorded_bytes += frame.datalen;
+		}
+	} else if (type == SWITCH_ABC_TYPE_READ_REPLACE) {
+		switch_frame_t *frame = switch_core_media_bug_get_read_replace_frame(bug);
+		test->replacements++;
+		if (switch_test_flag(frame, SFF_PLC)) test->replacement_plc++;
+		switch_core_media_bug_set_read_replace_frame(bug, frame);
+	}
+	return SWITCH_TRUE;
+}
+
 FST_CORE_BEGIN("./conf")
 {
 	FST_SUITE_BEGIN(switch_opus)
 	{
 		FST_SETUP_BEGIN()
 		{
+			/* These in-process cases originate more sessions than the default
+			 * production rate limit permits within one clock tick. */
+			switch_core_sessions_per_second(1000);
 			fst_requires_module("mod_loopback");
 			fst_requires_module("mod_opus");
 		}
@@ -123,6 +164,81 @@ FST_CORE_BEGIN("./conf")
 		{
 		}
 		FST_TEARDOWN_END()
+
+		FST_TEST_BEGIN(test_opus_plc_recording_transcode)
+		{
+			int mode;
+			/* No bug, recording, then recording plus a read-replace callback. */
+			for (mode = 0; mode < 3; mode++) {
+				switch_core_session_t *source = NULL, *sink = NULL;
+				switch_codec_t opus = { 0 }, pcmu = { 0 };
+				switch_call_cause_t cause;
+				switch_media_bug_t *bug = NULL;
+				opus_plc_test_t test = { 0 };
+				unsigned char stale[60] = { 0x41, 0x00, 0x16, 0x80 };
+				unsigned char silence[] = { 0xf8, 0xff, 0xfe };
+				int packet;
+
+				fst_requires(switch_ivr_originate(NULL, &source, &cause, "null/plc-source", 2,
+						NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, NULL) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_ivr_originate(NULL, &sink, &cause, "null/plc-sink", 2,
+						NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, NULL) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_core_codec_init(&opus, "OPUS", "mod_opus", NULL, 48000, 20, 1,
+						SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
+						switch_core_session_get_pool(source)) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_core_codec_init(&pcmu, "PCMU", NULL, NULL, 8000, 20, 1,
+						SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
+						switch_core_session_get_pool(sink)) == SWITCH_STATUS_SUCCESS);
+				switch_core_session_set_read_codec(source, &opus);
+				switch_core_session_set_write_codec(sink, &pcmu);
+				switch_channel_set_private(switch_core_session_get_channel(source), "opus-plc-test", &test);
+				fst_requires(switch_core_event_hook_add_read_frame(source, opus_plc_read) == SWITCH_STATUS_SUCCESS);
+				if (mode) {
+					fst_requires(switch_core_media_bug_add(source, "plc-recording", NULL, opus_plc_bug, &test, 0,
+							SMBF_READ_STREAM | (mode == 2 ? SMBF_READ_REPLACE : 0), &bug) == SWITCH_STATUS_SUCCESS);
+				}
+
+				/* Normal audio, three consecutive concealed frames, then recovery. */
+				for (packet = 0; packet < 5; packet++) {
+					switch_frame_t *frame = NULL;
+					int plc = packet > 0 && packet < 4;
+					memset(&test.input, 0, sizeof(test.input));
+					test.input.data = plc ? stale : silence;
+					test.input.datalen = test.input.buflen = plc ? sizeof(stale) : sizeof(silence);
+					test.input.codec = &opus;
+					test.input.rate = 48000;
+					test.input.samples = 960;
+					test.input.channels = 1;
+					test.input.flags = plc ? SFF_PLC : 0;
+					test.input.seq = 28942 + packet;
+					test.input.payload = 103;
+					fst_requires(switch_core_session_read_frame(source, &frame, SWITCH_IO_FLAG_NONE, 0) == SWITCH_STATUS_SUCCESS);
+					fst_requires(frame != NULL);
+					if (mode != 2) {
+						fst_check(frame == &test.input);
+						fst_xcheck(!!switch_test_flag(frame, SFF_PLC) == plc,
+								switch_core_sprintf(fst_pool, "mode %d packet %d: original PLC flag must survive recording", mode, packet));
+					}
+					fst_xcheck(switch_core_session_write_frame(sink, frame, SWITCH_IO_FLAG_NONE, 0) == SWITCH_STATUS_SUCCESS,
+							switch_core_sprintf(fst_pool, "mode %d packet %d: bridge transcode must succeed", mode, packet));
+				}
+				if (mode) {
+					fst_check_int_equals(test.recorded_bytes, 5 * 960 * sizeof(int16_t));
+					fst_check_int_equals(test.replacements, mode == 2 ? 5 : 0);
+					fst_check_int_equals(test.replacement_plc, 0);
+					switch_core_media_bug_remove(source, &bug);
+				}
+				switch_core_event_hook_remove_read_frame(source, opus_plc_read);
+				switch_channel_set_private(switch_core_session_get_channel(source), "opus-plc-test", NULL);
+				switch_core_session_set_read_codec(source, NULL);
+				switch_core_session_unset_write_codec(sink);
+				switch_core_codec_destroy(&opus);
+				switch_core_codec_destroy(&pcmu);
+				opus_test_close(&source);
+				opus_test_close(&sink);
+			}
+		}
+		FST_TEST_END()
 
 		FST_TEST_BEGIN(test_opus_negotiation)
 		{

@@ -418,6 +418,12 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_read_frame(switch_core_sessi
 		}
 
 		if (read_frame->codec || (is_cng && session->plc)) {
+			unsigned int bug_decode_flags = read_frame->flags;
+			/* A media-bug-only decode returns the original compressed frame.
+			 * Keep its PLC flag for a later bridge decode, while allowing the
+			 * private decode to consume flags on the recording's PCM frame. */
+			unsigned int *decode_flags = do_bugs ? &bug_decode_flags : &read_frame->flags;
+
 			session->raw_read_frame.datalen = session->raw_read_frame.buflen;
 
 			if (is_cng) {
@@ -434,6 +440,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_read_frame(switch_core_sessi
 				session->raw_read_frame.samples = session->raw_read_frame.datalen / sizeof(int16_t) / session->read_impl.number_of_channels;
 				session->raw_read_frame.channels = read_frame->codec->implementation->number_of_channels;
 				read_frame = &session->raw_read_frame;
+				decode_flags = &read_frame->flags;
 				status = SWITCH_STATUS_SUCCESS;
 			} else {
 				switch_codec_t *use_codec = read_frame->codec;
@@ -501,7 +508,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_read_frame(switch_core_sessi
 													  read_frame->datalen,
 													  session->read_impl.actual_samples_per_second,
 													  session->raw_read_frame.data, &session->raw_read_frame.datalen, &session->raw_read_frame.rate,
-													  &read_frame->flags);
+													  decode_flags);
 
 					if (status == SWITCH_STATUS_NOT_INITALIZED) {
 						switch_thread_rwlock_unlock(session->bug_rwlock);
@@ -518,9 +525,9 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_read_frame(switch_core_sessi
 
 				if (status == SWITCH_STATUS_SUCCESS && session->read_impl.number_of_channels == 1) {
 					if (session->plc) {
-						if (switch_test_flag(read_frame, SFF_PLC)) {
+						if (*decode_flags & SFF_PLC) {
 							switch_plc_fillin(session->plc, session->raw_read_frame.data, session->raw_read_frame.datalen / 2);
-							switch_clear_flag(read_frame, SFF_PLC);
+							*decode_flags &= ~SFF_PLC;
 						} else {
 							switch_plc_rx(session->plc, session->raw_read_frame.data, session->raw_read_frame.datalen / 2);
 						}
@@ -584,7 +591,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_read_frame(switch_core_sessi
 				session->raw_read_frame.m = read_frame->m;
 				session->raw_read_frame.payload = read_frame->payload;
 				session->raw_read_frame.flags = 0;
-				if (switch_test_flag(read_frame, SFF_PLC)) {
+				if (*decode_flags & SFF_PLC) {
 					session->raw_read_frame.flags |= SFF_PLC;
 				}
 				read_frame = &session->raw_read_frame;
@@ -619,7 +626,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_session_read_frame(switch_core_sessi
 				session->raw_read_frame.m = read_frame->m;
 				session->raw_read_frame.payload = read_frame->payload;
 				session->raw_read_frame.flags = 0;
-				if (switch_test_flag(read_frame, SFF_PLC)) {
+				if (*decode_flags & SFF_PLC) {
 					session->raw_read_frame.flags |= SFF_PLC;
 				}
 
