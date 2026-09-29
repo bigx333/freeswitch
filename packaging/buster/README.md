@@ -14,12 +14,12 @@ git and curl.
 ./build.sh                      # all .debs -> debs/
 ./build.sh --bundle             # also dist/freeswitch-<version>-<commit>.tar.gz
 ./build.sh --target deps-out    # dependency .debs only
-PKG_VERSION=1.10.12-4~buster1 ./build.sh
+PKG_VERSION=1.10.12-5~buster1 ./build.sh
 ```
 
 `build.sh` builds the **committed** `HEAD` (a shallow clone in `.build/`), so
 the commit hash ends up in the FreeSWITCH version string. Bump `PKG_VERSION`
-(default `1.10.12-4~buster1`) for every release you ship so `apt`/`dpkg` see an
+(default `1.10.12-5~buster1`) for every release you ship so `apt`/`dpkg` see an
 upgrade. `1.10.12-2~buster1` was the first Opus backport build.
 
 `--bundle` writes a transfer tarball with the `.debs`, `SHA256SUMS` and
@@ -28,14 +28,15 @@ upgrade. `1.10.12-2~buster1` was the first Opus backport build.
 ## Test
 
 ```sh
-./test.sh                       # switch_opus switch_rtp switch_core_codec
+./test.sh                       # switch_opus switch_rtp switch_core_codec sofia
 ./test.sh switch_opus
 ```
 
 Builds the Dockerfile's `deps` stage as the `fs-buster-deps` image, then does a
-minimal core build (console, commands, dptools, spandsp, opus, loopback) of the
+minimal core build (console, commands, dptools, spandsp, opus, loopback, sofia, test) of the
 committed `HEAD` in `.build/test-src` and runs the given unit tests. Later runs
-are incremental.
+are incremental. The Sofia suite includes a concurrent media-notification regression
+for the codec/Sofia deadlock backported from upstream commit `b4ebd0936c`.
 
 ## Layout
 

@@ -13,9 +13,11 @@ loggers/mod_console
 applications/mod_commands
 applications/mod_dptools
 applications/mod_spandsp
+applications/mod_test
 codecs/mod_opus
 dialplans/mod_dialplan_xml
 endpoints/mod_loopback
+endpoints/mod_sofia
 formats/mod_tone_stream
 MODS
 
@@ -26,13 +28,16 @@ if [ ! -f config.status ]; then
 fi
 make -j"$(nproc)" >/tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
 make install >/tmp/install.log 2>&1 || { tail -20 /tmp/install.log; exit 1; }
-make -C tests/unit -j"$(nproc)" "$@" >/tmp/tests-make.log 2>&1 || { tail -40 /tmp/tests-make.log; exit 1; }
-
 status=0
-cd tests/unit
 for t in "$@"; do
   echo "== $t"
-  ./"$t" > "/tmp/$t.log" 2>&1 || status=1
+  if [ "$t" = sofia ]; then
+    make -C src/mod/endpoints/mod_sofia -j"$(nproc)" test/test_sofia_funcs >/tmp/tests-make.log 2>&1 || { tail -40 /tmp/tests-make.log; exit 1; }
+    (cd src/mod/endpoints/mod_sofia/test && timeout 90 ./test_sofia_funcs) > "/tmp/$t.log" 2>&1 || status=1
+  else
+    make -C tests/unit -j"$(nproc)" "$t" >/tmp/tests-make.log 2>&1 || { tail -40 /tmp/tests-make.log; exit 1; }
+    (cd tests/unit && timeout 90 ./"$t") > "/tmp/$t.log" 2>&1 || status=1
+  fi
   grep -E "^(PASSED|FAILED)|TEST FAIL" "/tmp/$t.log" || { tail -20 "/tmp/$t.log"; status=1; }
 done
 exit $status

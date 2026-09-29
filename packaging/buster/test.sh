@@ -2,7 +2,7 @@
 # Build the core and the modules the Opus/RTP unit tests need, then run those
 # tests, inside the Buster dependency image (the Dockerfile's "deps" stage).
 #
-#   ./test.sh                               # switch_opus switch_rtp switch_core_codec
+#   ./test.sh                               # switch_opus switch_rtp switch_core_codec sofia
 #   ./test.sh switch_opus                   # a subset
 #
 # Works on a scratch clone of the committed HEAD in .build/test-src, which is
@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 ROOT=$(git rev-parse --show-toplevel)
 IMAGE=fs-buster-deps
 TESTS=("$@")
-[ ${#TESTS[@]} -gt 0 ] || TESTS=(switch_opus switch_rtp switch_core_codec)
+[ ${#TESTS[@]} -gt 0 ] || TESTS=(switch_opus switch_rtp switch_core_codec sofia)
 
 sudo docker buildx build --progress=quiet --target deps --load -t "$IMAGE" .
 

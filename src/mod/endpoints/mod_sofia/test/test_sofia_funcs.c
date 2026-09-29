@@ -31,11 +31,53 @@
 
 #include <switch.h>
 #include <test/switch_test.h>
+#include "../mod_sofia.h"
 
 int protect_dest_uri(switch_caller_profile_t *cp);
 
 static int timeout_sec = 10;
 static switch_interval_time_t delay_start_ms = 5000;
+
+typedef struct {
+	switch_core_session_t *session;
+	switch_core_session_message_types_t message_id;
+	int numeric_arg;
+	switch_mutex_t *mutex;
+	switch_thread_cond_t *cond;
+	int ready;
+	int proceed;
+	int send;
+	int completed;
+	switch_status_t status;
+} media_notification_test_t;
+
+static void *SWITCH_THREAD_FUNC send_media_notification(switch_thread_t *thread, void *obj)
+{
+	media_notification_test_t *test = obj;
+	switch_core_session_message_t msg = { 0 };
+
+	/* Match the write-frame path: notifications are sent with this lock held. */
+	switch_core_session_lock_codec_write(test->session);
+	switch_mutex_lock(test->mutex);
+	test->ready = 1;
+	switch_thread_cond_signal(test->cond);
+	while (!test->proceed) {
+		switch_thread_cond_wait(test->cond, test->mutex);
+	}
+	switch_mutex_unlock(test->mutex);
+	if (test->send) {
+		msg.message_id = test->message_id;
+		msg.numeric_arg = test->numeric_arg;
+		test->status = switch_core_session_receive_message(test->session, &msg);
+	}
+	switch_core_session_unlock_codec_write(test->session);
+
+	switch_mutex_lock(test->mutex);
+	test->completed = 1;
+	switch_thread_cond_signal(test->cond);
+	switch_mutex_unlock(test->mutex);
+	return NULL;
+}
 
 FST_CORE_EX_BEGIN("./conf", SCF_VG | SCF_USE_SQL)
 
@@ -118,6 +160,106 @@ FST_TEST_BEGIN(originate_test)
 		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_CLEARING);
 		switch_core_session_rwunlock(session);
 		switch_sleep(1 * 1000 * 1000);
+	}
+}
+FST_TEST_END()
+
+FST_TEST_BEGIN(media_notifications_do_not_wait_for_sofia_mutex)
+{
+	switch_core_session_t *session = NULL;
+	switch_call_cause_t cause;
+	switch_status_t status;
+	const char *local_ip_v4 = switch_core_get_variable("local_ip_v4");
+
+	status = switch_ivr_originate(NULL, &session, &cause,
+		switch_core_sprintf(fst_pool, "{ignore_early_media=true}sofia/internal/park@%s:53060", local_ip_v4),
+		timeout_sec, NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, NULL);
+	fst_check(status == SWITCH_STATUS_SUCCESS);
+	fst_check(session != NULL);
+	if (session) {
+		private_object_t *tech_pvt = switch_core_session_get_private(session);
+		struct { switch_core_session_message_types_t id; int arg; } cases[] = {
+			{ SWITCH_MESSAGE_RESAMPLE_EVENT, 1 },
+			{ SWITCH_MESSAGE_RESAMPLE_EVENT, 0 },
+			{ SWITCH_MESSAGE_INDICATE_TRANSCODING_NECESSARY, 0 }
+		};
+		unsigned int i;
+
+		for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			media_notification_test_t test = { 0 };
+			switch_threadattr_t *attr;
+			switch_thread_t *worker;
+			switch_status_t joined;
+			switch_time_t deadline;
+			int completed_while_locked = 0;
+			int sofia_locked = 0;
+
+			test.session = session;
+			test.message_id = cases[i].id;
+			test.numeric_arg = cases[i].arg;
+			switch_mutex_init(&test.mutex, SWITCH_MUTEX_NESTED, fst_pool);
+			switch_thread_cond_create(&test.cond, fst_pool);
+			switch_threadattr_create(&attr, fst_pool);
+			switch_threadattr_detach_set(attr, 0);
+			switch_threadattr_stacksize_set(attr, SWITCH_THREAD_STACKSIZE);
+
+			/* Wait for the writer to own its codec lock before taking the
+			 * Sofia lock. Otherwise a pending SIP event can own the codec
+			 * lock first and the test itself would invert the fixed order. */
+			status = switch_thread_create(&worker, attr, send_media_notification, &test, fst_pool);
+			fst_check(status == SWITCH_STATUS_SUCCESS);
+			if (status != SWITCH_STATUS_SUCCESS) {
+				switch_thread_cond_destroy(test.cond);
+				switch_mutex_destroy(test.mutex);
+				continue;
+			}
+			switch_mutex_lock(test.mutex);
+			while (!test.ready) {
+				switch_thread_cond_wait(test.cond, test.mutex);
+			}
+			switch_mutex_unlock(test.mutex);
+
+			/* A SIP dispatcher owns this mutex during codec setup. The
+			 * notification must finish before it is released, otherwise
+			 * codec setup's write-lock acquisition would close the cycle.
+			 * Release it on timeout so the old code fails without hanging. */
+			deadline = switch_micro_time_now() + 2000000;
+			while (switch_micro_time_now() < deadline) {
+				if (switch_mutex_trylock(tech_pvt->sofia_mutex) == SWITCH_STATUS_SUCCESS) {
+					sofia_locked = 1;
+					break;
+				}
+				switch_sleep(1000);
+			}
+			fst_check(sofia_locked);
+			switch_mutex_lock(test.mutex);
+			test.send = sofia_locked;
+			test.proceed = 1;
+			switch_thread_cond_signal(test.cond);
+			if (sofia_locked) {
+				deadline = switch_micro_time_now() + 2000000;
+				while (!test.completed && switch_micro_time_now() < deadline) {
+					switch_thread_cond_timedwait(test.cond, test.mutex, 100000);
+				}
+				completed_while_locked = test.completed;
+			}
+			switch_mutex_unlock(test.mutex);
+			if (sofia_locked) {
+				switch_mutex_unlock(tech_pvt->sofia_mutex);
+			}
+			switch_thread_join(&joined, worker);
+			if (sofia_locked) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+					"Notification %d/%d completed with Sofia locked: %d\n", cases[i].id, cases[i].arg, completed_while_locked);
+				fst_check(completed_while_locked);
+				fst_check(test.status == SWITCH_STATUS_SUCCESS);
+			}
+			switch_thread_cond_destroy(test.cond);
+			switch_mutex_destroy(test.mutex);
+		}
+		switch_channel_hangup(switch_core_session_get_channel(session), SWITCH_CAUSE_NORMAL_CLEARING);
+		switch_core_session_rwunlock(session);
+		switch_sleep(1000000);
 	}
 }
 FST_TEST_END()
