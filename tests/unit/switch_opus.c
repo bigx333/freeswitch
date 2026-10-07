@@ -48,6 +48,33 @@ static char *opus_test_sdp(switch_core_session_t *session, int rate, const char 
 			port, rate, *fmtp ? "a=fmtp:111 " : "", fmtp, *fmtp ? "\r\n" : "");
 }
 
+/* Plain UDP socket on an ephemeral loopback port, standing in for the remote RTP peer. */
+static switch_status_t rtp_test_peer(switch_memory_pool_t *pool, switch_socket_t **peer, switch_sockaddr_t **peer_addr)
+{
+	if (switch_sockaddr_info_get(peer_addr, "127.0.0.1", SWITCH_INET, 0, 0, pool) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_create(peer, SWITCH_INET, SOCK_DGRAM, SWITCH_PROTO_UDP, pool) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_bind(*peer, *peer_addr) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_addr_get(peer_addr, SWITCH_FALSE, *peer) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_timeout_set(*peer, 5000) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+	return SWITCH_STATUS_SUCCESS;
+}
+
+/* Fixed 12-byte RTP header; byte 1 carries the marker bit and payload type. */
+static void rtp_test_header(unsigned char *packet, uint8_t m_pt, uint16_t seq, uint32_t ts)
+{
+	uint32_t ssrc = htonl(0x12345678);
+
+	packet[0] = 0x80;
+	packet[1] = m_pt;
+	packet[2] = seq >> 8;
+	packet[3] = seq & 0xff;
+	ts = htonl(ts);
+	memcpy(packet + 4, &ts, 4);
+	memcpy(packet + 8, &ssrc, 4);
+}
+
 /* Loopback RTP session paired with a plain UDP peer socket, for RFC 4733 checks. */
 static switch_rtp_t *dtmf_test_rtp(switch_memory_pool_t *pool, uint32_t samples_per_interval,
 			switch_socket_t **peer, switch_sockaddr_t **rtp_addr)
@@ -58,11 +85,7 @@ static switch_rtp_t *dtmf_test_rtp(switch_memory_pool_t *pool, uint32_t samples_
 	const char *err = NULL;
 	switch_rtp_t *rtp;
 
-	if (switch_sockaddr_info_get(&peer_addr, "127.0.0.1", SWITCH_INET, 0, 0, pool) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_create(peer, SWITCH_INET, SOCK_DGRAM, SWITCH_PROTO_UDP, pool) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_bind(*peer, peer_addr) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_addr_get(&peer_addr, SWITCH_FALSE, *peer) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_timeout_set(*peer, 5000) != SWITCH_STATUS_SUCCESS ||
+	if (rtp_test_peer(pool, peer, &peer_addr) != SWITCH_STATUS_SUCCESS ||
 		switch_sockaddr_info_get(rtp_addr, "127.0.0.1", SWITCH_INET, rtp_port, 0, pool) != SWITCH_STATUS_SUCCESS) {
 		return NULL;
 	}
@@ -86,16 +109,10 @@ static void dtmf_test_read(switch_rtp_t *rtp)
 static void dtmf_test_send_event(switch_socket_t *peer, switch_sockaddr_t *rtp_addr, uint16_t seq, uint32_t ts,
 			int marker, int end, uint16_t duration)
 {
-	unsigned char packet[16] = { 0x80 };
+	unsigned char packet[16];
 	switch_size_t len = sizeof(packet);
-	uint32_t ssrc = htonl(0x12345678);
 
-	packet[1] = (marker ? 0x80 : 0) | 101;
-	packet[2] = seq >> 8;
-	packet[3] = seq & 0xff;
-	ts = htonl(ts);
-	memcpy(packet + 4, &ts, 4);
-	memcpy(packet + 8, &ssrc, 4);
+	rtp_test_header(packet, (marker ? 0x80 : 0) | 101, seq, ts);
 	packet[12] = 5; /* digit '5' */
 	packet[13] = (end ? 0x80 : 0) | 10;
 	packet[14] = duration >> 8;
@@ -107,6 +124,27 @@ static switch_status_t opus_test_write_rtp(switch_core_session_t *session, switc
 			switch_io_flag_t flags, int stream_id)
 {
 	return switch_core_media_write_frame(session, frame, flags, stream_id, SWITCH_MEDIA_TYPE_AUDIO);
+}
+
+/* Synthetic audio only: exercise the real UDP/RTP/media read path without
+ * embedding a customer's capture or requiring a licensed G.729 decoder. */
+static switch_status_t opus_test_send_audio(switch_socket_t *peer, switch_sockaddr_t *rtp_addr,
+		uint8_t payload, uint16_t seq, uint32_t timestamp)
+{
+	unsigned char packet[172];
+	/* A 20 ms Opus frame padded to 40 bytes, a size the CBR timing check also inspects. */
+	unsigned char opus_silence[40] = { 0xfb, 0x41, 0x23, 0xff, 0xfe };
+	switch_size_t len = 12;
+
+	rtp_test_header(packet, payload, seq, timestamp);
+	if (payload == 111) {
+		memcpy(packet + 12, opus_silence, sizeof(opus_silence));
+		len += sizeof(opus_silence);
+	} else {
+		len += payload == 18 ? 20 : 160;
+		memset(packet + 12, payload == 18 ? 0 : 0xff, len - 12);
+	}
+	return switch_socket_sendto(peer, rtp_addr, 0, (void *) packet, &len);
 }
 
 /* Feed the real read/media-bug/write path the frame produced by a jitter
@@ -164,6 +202,138 @@ FST_CORE_BEGIN("./conf")
 		{
 		}
 		FST_TEARDOWN_END()
+
+		FST_TEST_BEGIN(test_negotiated_payload_switch)
+		{
+			/* The jitter buffer delays frames, so that case checks each frame
+			 * against its own payload rather than the packet just sent. */
+			struct { uint8_t alternate; const char *jb_msec; } cases[] = { { 0, NULL }, { 18, NULL }, { 0, "60" } };
+			unsigned int i;
+			for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+				switch_core_session_t *session = NULL, *sink = NULL;
+				switch_codec_t pcmu = { 0 };
+				switch_call_cause_t cause;
+				switch_socket_t *peer = NULL;
+				switch_sockaddr_t *peer_addr, *rtp_addr;
+				switch_channel_t *channel;
+				switch_rtp_t *rtp;
+				uint8_t proceed = 0;
+				uint16_t seq = 100;
+				uint32_t timestamp = 1000;
+				uint8_t last_payload = 111;
+				int phase, packet;
+				char *sdp;
+
+				if (cases[i].alternate == 18 && switch_loadable_module_exists("mod_g729") != SWITCH_STATUS_SUCCESS) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_g729 is not loaded, skipping the G.729 case\n");
+					continue;
+				}
+
+				fst_requires(rtp_test_peer(fst_pool, &peer, &peer_addr) == SWITCH_STATUS_SUCCESS);
+				fst_requires(opus_test_session("opus@16000h,PCMU,G729", &session) == SWITCH_STATUS_SUCCESS);
+				/* Sofia profiles enable timing correction by default. */
+				switch_media_handle_set_media_flag(switch_core_session_get_media_handle(session), SCMF_AUTOFIX_TIMING);
+				channel = switch_core_session_get_channel(session);
+				sdp = switch_core_session_sprintf(session,
+						"v=0\r\no=test 1 1 IN IP4 127.0.0.1\r\ns=test\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"
+						"m=audio %d RTP/AVP 111 0 18\r\na=rtpmap:111 opus/48000/2\r\n"
+						"a=rtpmap:0 PCMU/8000\r\na=rtpmap:18 G729/8000\r\na=ptime:20\r\n",
+						switch_sockaddr_get_port(peer_addr));
+				fst_requires(switch_core_media_negotiate_sdp(session, sdp, &proceed, SDP_OFFER) == 1);
+				fst_requires(switch_core_media_choose_ports(session, SWITCH_TRUE, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS);
+				if (cases[i].jb_msec) {
+					switch_channel_set_variable(channel, "jitterbuffer_msec", cases[i].jb_msec);
+				}
+				fst_requires(switch_core_media_activate_rtp(session) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_sockaddr_info_get(&rtp_addr, "127.0.0.1", SWITCH_INET,
+						atoi(switch_channel_get_variable(channel, SWITCH_LOCAL_MEDIA_PORT_VARIABLE)), 0, fst_pool) == SWITCH_STATUS_SUCCESS);
+				rtp = switch_core_media_get_rtp_session(session, SWITCH_MEDIA_TYPE_AUDIO);
+				fst_requires(rtp != NULL);
+				fst_requires(!cases[i].jb_msec == !switch_rtp_get_jitter_buffer(rtp));
+				switch_rtp_clear_flag(rtp, SWITCH_RTP_FLAG_PAUSE);
+				if (cases[i].alternate == 0 && !cases[i].jb_msec) {
+					fst_requires(switch_ivr_originate(NULL, &sink, &cause, "null/payload-sink", 2,
+							NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, NULL) == SWITCH_STATUS_SUCCESS);
+					fst_requires(switch_core_codec_init(&pcmu, "PCMU", NULL, NULL, 8000, 20, 1,
+							SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
+							switch_core_session_get_pool(sink)) == SWITCH_STATUS_SUCCESS);
+					switch_core_session_set_write_codec(sink, &pcmu);
+				}
+
+				/* Phases 0-4: both directions, repeated, with steady traffic between
+				 * changes. Phase 5: a payload type that was never negotiated, let
+				 * through by the RTP layer (its PT filter also guards the jitter
+				 * buffer, so that case skips it). Phase 6: a 4-packet burst of the
+				 * alternate, then Opus, as a Yealink sends while resuming from hold.
+				 * A packet may come back as CNG; every audio frame must already carry
+				 * the decoder matching its received payload, including the first. */
+				for (phase = 0; phase < 7; phase++) {
+					int unknown = phase == 5, burst = phase == 6;
+					int packets = burst ? 16 : unknown ? 3 : 12;
+					int audio_frames = 0, opus_frames = 0, unknown_cng = 0;
+
+					if (unknown) {
+						if (cases[i].jb_msec) continue;
+						switch_rtp_intentional_bugs(rtp, RTP_BUG_ACCEPT_ANY_PACKETS);
+					}
+
+					for (packet = 0; packet < packets; packet++) {
+						uint8_t payload = unknown ? 8 : burst ? (packet < 4 ? cases[i].alternate : 111) :
+								(phase % 2 ? cases[i].alternate : 111);
+						const char *expected, *iananame;
+						switch_frame_t *frame = NULL;
+
+						if (payload == 111 && last_payload != 111) {
+							/* The Yealink in the capture restarts the Opus clock when it switches back. */
+							timestamp = 960;
+						}
+						last_payload = payload;
+						fst_requires(opus_test_send_audio(peer, rtp_addr, payload, seq++, timestamp) == SWITCH_STATUS_SUCCESS);
+						timestamp += payload == 111 ? 960 : 160;
+						fst_requires(switch_core_media_read_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0,
+								SWITCH_MEDIA_TYPE_AUDIO) == SWITCH_STATUS_SUCCESS);
+						fst_requires(frame != NULL);
+						/* A stale Opus decoder given the synthetic PCMU packet
+						 * also reproduces the fatal write error seen by a bridge. */
+						if (sink) {
+							fst_check(switch_core_session_write_frame(sink, frame, SWITCH_IO_FLAG_NONE, 0) == SWITCH_STATUS_SUCCESS);
+						}
+						if (switch_test_flag(frame, SFF_CNG)) {
+							unknown_cng += frame->payload == 8;
+							continue;
+						}
+						fst_requires(frame->codec && frame->codec->implementation);
+						iananame = frame->codec->implementation->iananame;
+						expected = unknown ? "CNG" : frame->payload == 111 ? "OPUS" : frame->payload == 18 ? "G729" : "PCMU";
+						fct_xchk((cases[i].jb_msec || frame->payload == payload) && !strcasecmp(iananame, expected),
+								"case %u phase %d: payload %d returned with %s decoder, expected %s (sent payload %d)",
+								i, phase, frame->payload, iananame, expected, payload);
+						opus_frames += frame->payload == 111;
+						audio_frames++;
+					}
+					if (unknown) {
+						fct_xchk(unknown_cng > 0, "case %u: unnegotiated payload never reached the media layer", i);
+					} else {
+						fct_xchk(audio_frames > 0, "case %u phase %d: audio must recover after the codec change", i, phase);
+					}
+					if (burst && !cases[i].jb_msec) {
+						/* The codec reset flushes queued RTP, which costs 2 packets in this
+						 * send-one-read-one loop. Anything that delays the switch back loses more. */
+						fct_xchk(opus_frames >= 10, "case %u: %d of 12 Opus packets after the burst were decoded", i, opus_frames);
+					}
+					fst_check(switch_channel_up_nosig(channel));
+				}
+				opus_test_close(&session);
+				if (sink) {
+					switch_core_session_unset_write_codec(sink);
+					switch_core_codec_destroy(&pcmu);
+					switch_channel_hangup(switch_core_session_get_channel(sink), SWITCH_CAUSE_NORMAL_CLEARING);
+					switch_core_session_rwunlock(sink);
+				}
+				switch_socket_close(peer);
+			}
+		}
+		FST_TEST_END()
 
 		FST_TEST_BEGIN(test_opus_plc_recording_transcode)
 		{

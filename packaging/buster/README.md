@@ -14,12 +14,12 @@ git and curl.
 ./build.sh                      # all .debs -> debs/
 ./build.sh --bundle             # also dist/freeswitch-<version>-<commit>.tar.gz
 ./build.sh --target deps-out    # dependency .debs only
-PKG_VERSION=1.10.12-5~buster1 ./build.sh
+PKG_VERSION=1.10.12-6~buster1 ./build.sh
 ```
 
 `build.sh` builds the **committed** `HEAD` (a shallow clone in `.build/`), so
 the commit hash ends up in the FreeSWITCH version string. Bump `PKG_VERSION`
-(default `1.10.12-5~buster1`) for every release you ship so `apt`/`dpkg` see an
+(default `1.10.12-6~buster1`) for every release you ship so `apt`/`dpkg` see an
 upgrade. `1.10.12-2~buster1` was the first Opus backport build.
 
 `--bundle` writes a transfer tarball with the `.debs`, `SHA256SUMS` and
