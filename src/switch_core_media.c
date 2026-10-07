@@ -3051,6 +3051,63 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 					switch_goto_status(SWITCH_STATUS_GENERR, end);
 				}
 
+				/* autofix payload type, before the timing check judges the packet by the current codec */
+
+				if (!engine->reset_codec &&
+					engine->codec_negotiated &&
+					(!smh->mparams->cng_pt || engine->read_frame.payload != smh->mparams->cng_pt) &&
+					(!smh->mparams->recv_te || engine->read_frame.payload != smh->mparams->recv_te) &&
+					(!smh->mparams->te || engine->read_frame.payload != smh->mparams->te) &&
+					!switch_test_flag((&engine->read_frame), SFF_CNG) &&
+					!switch_test_flag((&engine->read_frame), SFF_PLC) &&
+					engine->read_frame.payload != engine->cur_payload_map->recv_pt &&
+					engine->read_frame.payload != engine->cur_payload_map->pt) {
+
+					payload_map_t *pmap;
+
+
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+									  "alternate payload received (received %d, expecting %d)\n",
+									  (int) engine->read_frame.payload, (int) engine->cur_payload_map->pt);
+
+
+					/* search for payload type */
+					switch_mutex_lock(smh->sdp_mutex);
+					for (pmap = engine->payload_map; pmap; pmap = pmap->next) {
+						if (engine->read_frame.payload == pmap->recv_pt && pmap->negotiated) {
+							engine->cur_payload_map = pmap;
+							engine->cur_payload_map->current = 1;
+							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+											  "Changing current codec to %s (payload type %d).\n",
+											  pmap->iananame, pmap->pt);
+
+							/* mark to re-set codec */
+							engine->reset_codec = 1;
+							break;
+						}
+					}
+					switch_mutex_unlock(smh->sdp_mutex);
+
+					if (engine->reset_codec) {
+						/* Reset now so the new codec, not the previous one, decodes this packet. */
+						if (media_reset_engine_codec(session, smh, engine, type) != SWITCH_STATUS_SUCCESS) {
+							*frame = NULL;
+							switch_goto_status(SWITCH_STATUS_GENERR, end);
+						}
+					} else if ((engine->rtp_bugs | smh->mparams->manual_rtp_bugs) & RTP_BUG_ACCEPT_ANY_PAYLOAD) {
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+										  "Could not change to payload type %d, ignoring...\n",
+										  (int) engine->read_frame.payload);
+					} else {
+						/* The current codec cannot decode this payload. */
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+										  "Could not change to payload type %d, dropping...\n",
+										  (int) engine->read_frame.payload);
+						media_read_cng(engine, frame);
+						switch_goto_status(SWITCH_STATUS_SUCCESS, end);
+					}
+				}
+
 				/* check for timing issues */
 				if (smh->media_flags[SCMF_AUTOFIX_TIMING] && type == SWITCH_MEDIA_TYPE_AUDIO && engine->read_impl.samples_per_second) {
 					char is_vbr;
@@ -3179,63 +3236,6 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 						engine->mismatch_count = 0;
 						engine->last_ts = 0;
 						engine->last_seq = 0;
-					}
-				}
-
-				/* autofix payload type */
-
-				if (!engine->reset_codec &&
-					engine->codec_negotiated &&
-					(!smh->mparams->cng_pt || engine->read_frame.payload != smh->mparams->cng_pt) &&
-					(!smh->mparams->recv_te || engine->read_frame.payload != smh->mparams->recv_te) &&
-					(!smh->mparams->te || engine->read_frame.payload != smh->mparams->te) &&
-					!switch_test_flag((&engine->read_frame), SFF_CNG) &&
-					!switch_test_flag((&engine->read_frame), SFF_PLC) &&
-					engine->read_frame.payload != engine->cur_payload_map->recv_pt &&
-					engine->read_frame.payload != engine->cur_payload_map->pt) {
-
-					payload_map_t *pmap;
-
-
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-									  "alternate payload received (received %d, expecting %d)\n",
-									  (int) engine->read_frame.payload, (int) engine->cur_payload_map->pt);
-
-
-					/* search for payload type */
-					switch_mutex_lock(smh->sdp_mutex);
-					for (pmap = engine->payload_map; pmap; pmap = pmap->next) {
-						if (engine->read_frame.payload == pmap->recv_pt && pmap->negotiated) {
-							engine->cur_payload_map = pmap;
-							engine->cur_payload_map->current = 1;
-							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-											  "Changing current codec to %s (payload type %d).\n",
-											  pmap->iananame, pmap->pt);
-
-							/* mark to re-set codec */
-							engine->reset_codec = 1;
-							break;
-						}
-					}
-					switch_mutex_unlock(smh->sdp_mutex);
-
-					if (engine->reset_codec) {
-						/* Reset now so the new codec, not the previous one, decodes this packet. */
-						if (media_reset_engine_codec(session, smh, engine, type) != SWITCH_STATUS_SUCCESS) {
-							*frame = NULL;
-							switch_goto_status(SWITCH_STATUS_GENERR, end);
-						}
-					} else if ((engine->rtp_bugs | smh->mparams->manual_rtp_bugs) & RTP_BUG_ACCEPT_ANY_PAYLOAD) {
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-										  "Could not change to payload type %d, ignoring...\n",
-										  (int) engine->read_frame.payload);
-					} else {
-						/* The current codec cannot decode this payload. */
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-										  "Could not change to payload type %d, dropping...\n",
-										  (int) engine->read_frame.payload);
-						media_read_cng(engine, frame);
-						switch_goto_status(SWITCH_STATUS_SUCCESS, end);
 					}
 				}
 
