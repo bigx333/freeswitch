@@ -259,14 +259,14 @@ FST_CORE_BEGIN("./conf")
 				/* Phases 0-4: both directions, repeated, with steady traffic between
 				 * changes. Phase 5: a payload type that was never negotiated, let
 				 * through by the RTP layer (its PT filter also guards the jitter
-				 * buffer, so that case skips it). Phase 6: two interleaved sources.
+				 * buffer, so that case skips it). Phase 6: a 4-packet burst of the
+				 * alternate, then Opus, as a Yealink sends while resuming from hold.
 				 * A packet may come back as CNG; every audio frame must already carry
 				 * the decoder matching its received payload, including the first. */
 				for (phase = 0; phase < 7; phase++) {
-					int unknown = phase == 5, interleaved = phase == 6;
-					int packets = interleaved ? 24 : unknown ? 3 : 12;
-					int audio_frames = 0, changes = 0, unknown_cng = 0;
-					const char *last = NULL;
+					int unknown = phase == 5, burst = phase == 6;
+					int packets = burst ? 16 : unknown ? 3 : 12;
+					int audio_frames = 0, opus_frames = 0, unknown_cng = 0;
 
 					if (unknown) {
 						if (cases[i].jb_msec) continue;
@@ -274,7 +274,8 @@ FST_CORE_BEGIN("./conf")
 					}
 
 					for (packet = 0; packet < packets; packet++) {
-						uint8_t payload = unknown ? 8 : ((interleaved ? packet : phase) % 2 ? cases[i].alternate : 111);
+						uint8_t payload = unknown ? 8 : burst ? (packet < 4 ? cases[i].alternate : 111) :
+								(phase % 2 ? cases[i].alternate : 111);
 						const char *expected, *iananame;
 						switch_frame_t *frame = NULL;
 
@@ -298,8 +299,7 @@ FST_CORE_BEGIN("./conf")
 						fct_xchk((cases[i].jb_msec || frame->payload == payload) && !strcasecmp(iananame, expected),
 								"case %u phase %d: payload %d returned with %s decoder, expected %s (sent payload %d)",
 								i, phase, frame->payload, iananame, expected, payload);
-						if (last && strcasecmp(last, iananame)) changes++;
-						last = iananame;
+						opus_frames += frame->payload == 111;
 						audio_frames++;
 					}
 					if (unknown) {
@@ -307,9 +307,10 @@ FST_CORE_BEGIN("./conf")
 					} else {
 						fct_xchk(audio_frames > 0, "case %u phase %d: audio must recover after the codec change", i, phase);
 					}
-					if (interleaved) {
-						/* Follow one source at a time; do not rebuild the codec per packet. */
-						fct_xchk(changes <= 3, "case %u: interleaved payloads caused %d codec changes in %d packets", i, changes, packets);
+					if (burst && !cases[i].jb_msec) {
+						/* The codec reset flushes queued RTP, which costs 2 packets in this
+						 * send-one-read-one loop. Anything that delays the switch back loses more. */
+						fct_xchk(opus_frames >= 10, "case %u: %d of 12 Opus packets after the burst were decoded", i, opus_frames);
 					}
 					fst_check(switch_channel_up_nosig(channel));
 				}
