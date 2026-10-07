@@ -109,6 +109,31 @@ static switch_status_t opus_test_write_rtp(switch_core_session_t *session, switc
 	return switch_core_media_write_frame(session, frame, flags, stream_id, SWITCH_MEDIA_TYPE_AUDIO);
 }
 
+/* Synthetic audio only: exercise the real UDP/RTP/media read path without
+ * embedding a customer's capture or requiring a licensed G.729 decoder. */
+static switch_status_t opus_test_send_audio(switch_socket_t *peer, switch_sockaddr_t *rtp_addr,
+		uint8_t payload, uint16_t seq, uint32_t timestamp)
+{
+	unsigned char packet[172] = { 0x80 };
+	unsigned char opus_silence[] = { 0xf8, 0xff, 0xfe };
+	uint32_t ssrc = htonl(0x12345678), ts = htonl(timestamp);
+	switch_size_t len = 12;
+
+	packet[1] = payload;
+	packet[2] = seq >> 8;
+	packet[3] = seq & 0xff;
+	memcpy(packet + 4, &ts, sizeof(ts));
+	memcpy(packet + 8, &ssrc, sizeof(ssrc));
+	if (payload == 111) {
+		memcpy(packet + 12, opus_silence, sizeof(opus_silence));
+		len += sizeof(opus_silence);
+	} else {
+		len += payload == 18 ? 20 : 160;
+		memset(packet + 12, payload == 18 ? 0 : 0xff, len - 12);
+	}
+	return switch_socket_sendto(peer, rtp_addr, 0, (void *) packet, &len);
+}
+
 /* Feed the real read/media-bug/write path the frame produced by a jitter
  * buffer. A PLC frame may still contain stale DTMF/CNG bytes, not Opus audio. */
 typedef struct {
@@ -164,6 +189,93 @@ FST_CORE_BEGIN("./conf")
 		{
 		}
 		FST_TEARDOWN_END()
+
+		FST_TEST_BEGIN(test_negotiated_payload_switch)
+		{
+			int alternates[] = { 0, 18 };
+			unsigned int codec;
+			fst_requires_module("mod_g729");
+			for (codec = 0; codec < sizeof(alternates) / sizeof(alternates[0]); codec++) {
+				switch_core_session_t *session = NULL, *sink = NULL;
+				switch_codec_t pcmu = { 0 };
+				switch_call_cause_t cause;
+				switch_socket_t *peer = NULL;
+				switch_sockaddr_t *peer_addr, *rtp_addr;
+				switch_channel_t *channel;
+				switch_rtp_t *rtp;
+				uint8_t proceed = 0;
+				uint16_t seq = 100;
+				uint32_t timestamp = 1000;
+				int phase, packet;
+				char *sdp;
+
+				fst_requires(switch_sockaddr_info_get(&peer_addr, "127.0.0.1", SWITCH_INET, 0, 0, fst_pool) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_socket_create(&peer, SWITCH_INET, SOCK_DGRAM, SWITCH_PROTO_UDP, fst_pool) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_socket_bind(peer, peer_addr) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_socket_addr_get(&peer_addr, SWITCH_FALSE, peer) == SWITCH_STATUS_SUCCESS);
+				fst_requires(opus_test_session("opus@16000h,PCMU,G729", &session) == SWITCH_STATUS_SUCCESS);
+				channel = switch_core_session_get_channel(session);
+				sdp = switch_core_session_sprintf(session,
+						"v=0\r\no=test 1 1 IN IP4 127.0.0.1\r\ns=test\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"
+						"m=audio %d RTP/AVP 111 0 18\r\na=rtpmap:111 opus/48000/2\r\n"
+						"a=rtpmap:0 PCMU/8000\r\na=rtpmap:18 G729/8000\r\na=ptime:20\r\n",
+						switch_sockaddr_get_port(peer_addr));
+				fst_requires(switch_core_media_negotiate_sdp(session, sdp, &proceed, SDP_OFFER) == 1);
+				fst_requires(switch_core_media_choose_ports(session, SWITCH_TRUE, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_core_media_activate_rtp(session) == SWITCH_STATUS_SUCCESS);
+				fst_requires(switch_sockaddr_info_get(&rtp_addr, "127.0.0.1", SWITCH_INET,
+						atoi(switch_channel_get_variable(channel, SWITCH_LOCAL_MEDIA_PORT_VARIABLE)), 0, fst_pool) == SWITCH_STATUS_SUCCESS);
+				rtp = switch_core_media_get_rtp_session(session, SWITCH_MEDIA_TYPE_AUDIO);
+				fst_requires(rtp != NULL);
+				switch_rtp_clear_flag(rtp, SWITCH_RTP_FLAG_PAUSE);
+				if (alternates[codec] == 0) {
+					fst_requires(switch_ivr_originate(NULL, &sink, &cause, "null/payload-sink", 2,
+							NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, NULL) == SWITCH_STATUS_SUCCESS);
+					fst_requires(switch_core_codec_init(&pcmu, "PCMU", NULL, NULL, 8000, 20, 1,
+							SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
+							switch_core_session_get_pool(sink)) == SWITCH_STATUS_SUCCESS);
+					switch_core_session_set_write_codec(sink, &pcmu);
+				}
+
+				/* Both directions, repeated, with steady traffic between changes.
+				 * A transition may return CNG; every audio frame must already carry
+				 * the decoder matching its received payload, including the first. */
+				for (phase = 0; phase < 5; phase++) {
+					uint8_t payload = phase % 2 ? alternates[codec] : 111;
+					const char *expected = payload == 111 ? "OPUS" : payload == 18 ? "G729" : "PCMU";
+					int audio_frames = 0;
+					for (packet = 0; packet < 10; packet++) {
+						switch_frame_t *frame = NULL;
+						fst_requires(opus_test_send_audio(peer, rtp_addr, payload, seq++, timestamp) == SWITCH_STATUS_SUCCESS);
+						timestamp += payload == 111 ? 960 : 160;
+						fst_requires(switch_core_media_read_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0,
+								SWITCH_MEDIA_TYPE_AUDIO) == SWITCH_STATUS_SUCCESS);
+						fst_requires(frame != NULL);
+						/* A stale Opus decoder given the synthetic PCMU packet
+						 * also reproduces the fatal write error seen by a bridge. */
+						if (sink) {
+							fst_check(switch_core_session_write_frame(sink, frame, SWITCH_IO_FLAG_NONE, 0) == SWITCH_STATUS_SUCCESS);
+						}
+						if (switch_test_flag(frame, SFF_CNG)) continue;
+						fst_requires(frame->codec && frame->codec->implementation);
+						fst_xcheck(frame->payload == payload && !strcasecmp(frame->codec->implementation->iananame, expected),
+								switch_core_sprintf(fst_pool, "phase %d: payload %d returned with %s decoder, expected %s for payload %d",
+								phase, frame->payload, frame->codec->implementation->iananame, expected, payload));
+						audio_frames++;
+					}
+					fst_xcheck(audio_frames > 0, switch_core_sprintf(fst_pool, "phase %d: audio must recover after the codec change", phase));
+					fst_check(switch_channel_up_nosig(channel));
+				}
+				opus_test_close(&session);
+				if (sink) {
+					switch_core_codec_destroy(&pcmu);
+					switch_channel_hangup(switch_core_session_get_channel(sink), SWITCH_CAUSE_NORMAL_CLEARING);
+					switch_core_session_rwunlock(sink);
+				}
+				switch_socket_close(peer);
+			}
+		}
+		FST_TEST_END()
 
 		FST_TEST_BEGIN(test_opus_plc_recording_transcode)
 		{

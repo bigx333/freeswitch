@@ -2860,6 +2860,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 			}
 		}
 
+	reset_codec:
 		/* re-set codec if necessary */
 		if (type != SWITCH_MEDIA_TYPE_TEXT && engine->reset_codec > 0) {
 			const char *val;
@@ -3206,7 +3207,12 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 					}
 					switch_mutex_unlock(smh->sdp_mutex);
 
-					if (!engine->reset_codec) {
+					if (engine->reset_codec) {
+						/* Reset before returning this packet. Otherwise it retains
+						 * the previous decoder and a decode error can end the bridge.
+						 * The reset path returns CNG for the transition packet. */
+						goto reset_codec;
+					} else {
 						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
 										  "Could not change to payload type %d, ignoring...\n",
 										  (int) engine->read_frame.payload);

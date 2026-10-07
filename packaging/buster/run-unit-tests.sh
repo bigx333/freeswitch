@@ -15,6 +15,7 @@ applications/mod_dptools
 applications/mod_spandsp
 applications/mod_test
 codecs/mod_opus
+codecs/mod_g729
 dialplans/mod_dialplan_xml
 endpoints/mod_loopback
 endpoints/mod_sofia
