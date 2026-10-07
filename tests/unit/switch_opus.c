@@ -48,6 +48,33 @@ static char *opus_test_sdp(switch_core_session_t *session, int rate, const char 
 			port, rate, *fmtp ? "a=fmtp:111 " : "", fmtp, *fmtp ? "\r\n" : "");
 }
 
+/* Plain UDP socket on an ephemeral loopback port, standing in for the remote RTP peer. */
+static switch_status_t rtp_test_peer(switch_memory_pool_t *pool, switch_socket_t **peer, switch_sockaddr_t **peer_addr)
+{
+	if (switch_sockaddr_info_get(peer_addr, "127.0.0.1", SWITCH_INET, 0, 0, pool) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_create(peer, SWITCH_INET, SOCK_DGRAM, SWITCH_PROTO_UDP, pool) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_bind(*peer, *peer_addr) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_addr_get(peer_addr, SWITCH_FALSE, *peer) != SWITCH_STATUS_SUCCESS ||
+		switch_socket_timeout_set(*peer, 5000) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+	return SWITCH_STATUS_SUCCESS;
+}
+
+/* Fixed 12-byte RTP header; byte 1 carries the marker bit and payload type. */
+static void rtp_test_header(unsigned char *packet, uint8_t m_pt, uint16_t seq, uint32_t ts)
+{
+	uint32_t ssrc = htonl(0x12345678);
+
+	packet[0] = 0x80;
+	packet[1] = m_pt;
+	packet[2] = seq >> 8;
+	packet[3] = seq & 0xff;
+	ts = htonl(ts);
+	memcpy(packet + 4, &ts, 4);
+	memcpy(packet + 8, &ssrc, 4);
+}
+
 /* Loopback RTP session paired with a plain UDP peer socket, for RFC 4733 checks. */
 static switch_rtp_t *dtmf_test_rtp(switch_memory_pool_t *pool, uint32_t samples_per_interval,
 			switch_socket_t **peer, switch_sockaddr_t **rtp_addr)
@@ -58,11 +85,7 @@ static switch_rtp_t *dtmf_test_rtp(switch_memory_pool_t *pool, uint32_t samples_
 	const char *err = NULL;
 	switch_rtp_t *rtp;
 
-	if (switch_sockaddr_info_get(&peer_addr, "127.0.0.1", SWITCH_INET, 0, 0, pool) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_create(peer, SWITCH_INET, SOCK_DGRAM, SWITCH_PROTO_UDP, pool) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_bind(*peer, peer_addr) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_addr_get(&peer_addr, SWITCH_FALSE, *peer) != SWITCH_STATUS_SUCCESS ||
-		switch_socket_timeout_set(*peer, 5000) != SWITCH_STATUS_SUCCESS ||
+	if (rtp_test_peer(pool, peer, &peer_addr) != SWITCH_STATUS_SUCCESS ||
 		switch_sockaddr_info_get(rtp_addr, "127.0.0.1", SWITCH_INET, rtp_port, 0, pool) != SWITCH_STATUS_SUCCESS) {
 		return NULL;
 	}
@@ -86,16 +109,10 @@ static void dtmf_test_read(switch_rtp_t *rtp)
 static void dtmf_test_send_event(switch_socket_t *peer, switch_sockaddr_t *rtp_addr, uint16_t seq, uint32_t ts,
 			int marker, int end, uint16_t duration)
 {
-	unsigned char packet[16] = { 0x80 };
+	unsigned char packet[16];
 	switch_size_t len = sizeof(packet);
-	uint32_t ssrc = htonl(0x12345678);
 
-	packet[1] = (marker ? 0x80 : 0) | 101;
-	packet[2] = seq >> 8;
-	packet[3] = seq & 0xff;
-	ts = htonl(ts);
-	memcpy(packet + 4, &ts, 4);
-	memcpy(packet + 8, &ssrc, 4);
+	rtp_test_header(packet, (marker ? 0x80 : 0) | 101, seq, ts);
 	packet[12] = 5; /* digit '5' */
 	packet[13] = (end ? 0x80 : 0) | 10;
 	packet[14] = duration >> 8;
@@ -114,16 +131,11 @@ static switch_status_t opus_test_write_rtp(switch_core_session_t *session, switc
 static switch_status_t opus_test_send_audio(switch_socket_t *peer, switch_sockaddr_t *rtp_addr,
 		uint8_t payload, uint16_t seq, uint32_t timestamp)
 {
-	unsigned char packet[172] = { 0x80 };
+	unsigned char packet[172];
 	unsigned char opus_silence[] = { 0xf8, 0xff, 0xfe };
-	uint32_t ssrc = htonl(0x12345678), ts = htonl(timestamp);
 	switch_size_t len = 12;
 
-	packet[1] = payload;
-	packet[2] = seq >> 8;
-	packet[3] = seq & 0xff;
-	memcpy(packet + 4, &ts, sizeof(ts));
-	memcpy(packet + 8, &ssrc, sizeof(ssrc));
+	rtp_test_header(packet, payload, seq, timestamp);
 	if (payload == 111) {
 		memcpy(packet + 12, opus_silence, sizeof(opus_silence));
 		len += sizeof(opus_silence);
@@ -192,10 +204,11 @@ FST_CORE_BEGIN("./conf")
 
 		FST_TEST_BEGIN(test_negotiated_payload_switch)
 		{
-			int alternates[] = { 0, 18 };
-			unsigned int codec;
-			fst_requires_module("mod_g729");
-			for (codec = 0; codec < sizeof(alternates) / sizeof(alternates[0]); codec++) {
+			/* The jitter buffer delays frames, so that case checks each frame
+			 * against its own payload rather than the packet just sent. */
+			struct { uint8_t alternate; const char *jb_msec; } cases[] = { { 0, NULL }, { 18, NULL }, { 0, "60" } };
+			unsigned int i;
+			for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 				switch_core_session_t *session = NULL, *sink = NULL;
 				switch_codec_t pcmu = { 0 };
 				switch_call_cause_t cause;
@@ -209,10 +222,12 @@ FST_CORE_BEGIN("./conf")
 				int phase, packet;
 				char *sdp;
 
-				fst_requires(switch_sockaddr_info_get(&peer_addr, "127.0.0.1", SWITCH_INET, 0, 0, fst_pool) == SWITCH_STATUS_SUCCESS);
-				fst_requires(switch_socket_create(&peer, SWITCH_INET, SOCK_DGRAM, SWITCH_PROTO_UDP, fst_pool) == SWITCH_STATUS_SUCCESS);
-				fst_requires(switch_socket_bind(peer, peer_addr) == SWITCH_STATUS_SUCCESS);
-				fst_requires(switch_socket_addr_get(&peer_addr, SWITCH_FALSE, peer) == SWITCH_STATUS_SUCCESS);
+				if (cases[i].alternate == 18 && switch_loadable_module_exists("mod_g729") != SWITCH_STATUS_SUCCESS) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "mod_g729 is not loaded, skipping the G.729 case\n");
+					continue;
+				}
+
+				fst_requires(rtp_test_peer(fst_pool, &peer, &peer_addr) == SWITCH_STATUS_SUCCESS);
 				fst_requires(opus_test_session("opus@16000h,PCMU,G729", &session) == SWITCH_STATUS_SUCCESS);
 				channel = switch_core_session_get_channel(session);
 				sdp = switch_core_session_sprintf(session,
@@ -222,13 +237,17 @@ FST_CORE_BEGIN("./conf")
 						switch_sockaddr_get_port(peer_addr));
 				fst_requires(switch_core_media_negotiate_sdp(session, sdp, &proceed, SDP_OFFER) == 1);
 				fst_requires(switch_core_media_choose_ports(session, SWITCH_TRUE, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS);
+				if (cases[i].jb_msec) {
+					switch_channel_set_variable(channel, "jitterbuffer_msec", cases[i].jb_msec);
+				}
 				fst_requires(switch_core_media_activate_rtp(session) == SWITCH_STATUS_SUCCESS);
 				fst_requires(switch_sockaddr_info_get(&rtp_addr, "127.0.0.1", SWITCH_INET,
 						atoi(switch_channel_get_variable(channel, SWITCH_LOCAL_MEDIA_PORT_VARIABLE)), 0, fst_pool) == SWITCH_STATUS_SUCCESS);
 				rtp = switch_core_media_get_rtp_session(session, SWITCH_MEDIA_TYPE_AUDIO);
 				fst_requires(rtp != NULL);
+				fst_requires(!cases[i].jb_msec == !switch_rtp_get_jitter_buffer(rtp));
 				switch_rtp_clear_flag(rtp, SWITCH_RTP_FLAG_PAUSE);
-				if (alternates[codec] == 0) {
+				if (cases[i].alternate == 0 && !cases[i].jb_msec) {
 					fst_requires(switch_ivr_originate(NULL, &sink, &cause, "null/payload-sink", 2,
 							NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, NULL) == SWITCH_STATUS_SUCCESS);
 					fst_requires(switch_core_codec_init(&pcmu, "PCMU", NULL, NULL, 8000, 20, 1,
@@ -237,15 +256,28 @@ FST_CORE_BEGIN("./conf")
 					switch_core_session_set_write_codec(sink, &pcmu);
 				}
 
-				/* Both directions, repeated, with steady traffic between changes.
-				 * A transition may return CNG; every audio frame must already carry
+				/* Phases 0-4: both directions, repeated, with steady traffic between
+				 * changes. Phase 5: a payload type that was never negotiated, let
+				 * through by the RTP layer (its PT filter also guards the jitter
+				 * buffer, so that case skips it). Phase 6: two interleaved sources.
+				 * A packet may come back as CNG; every audio frame must already carry
 				 * the decoder matching its received payload, including the first. */
-				for (phase = 0; phase < 5; phase++) {
-					uint8_t payload = phase % 2 ? alternates[codec] : 111;
-					const char *expected = payload == 111 ? "OPUS" : payload == 18 ? "G729" : "PCMU";
-					int audio_frames = 0;
-					for (packet = 0; packet < 10; packet++) {
+				for (phase = 0; phase < 7; phase++) {
+					int unknown = phase == 5, interleaved = phase == 6;
+					int packets = interleaved ? 24 : unknown ? 3 : 12;
+					int audio_frames = 0, changes = 0, unknown_cng = 0;
+					const char *last = NULL;
+
+					if (unknown) {
+						if (cases[i].jb_msec) continue;
+						switch_rtp_intentional_bugs(rtp, RTP_BUG_ACCEPT_ANY_PACKETS);
+					}
+
+					for (packet = 0; packet < packets; packet++) {
+						uint8_t payload = unknown ? 8 : ((interleaved ? packet : phase) % 2 ? cases[i].alternate : 111);
+						const char *expected, *iananame;
 						switch_frame_t *frame = NULL;
+
 						fst_requires(opus_test_send_audio(peer, rtp_addr, payload, seq++, timestamp) == SWITCH_STATUS_SUCCESS);
 						timestamp += payload == 111 ? 960 : 160;
 						fst_requires(switch_core_media_read_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0,
@@ -256,18 +288,34 @@ FST_CORE_BEGIN("./conf")
 						if (sink) {
 							fst_check(switch_core_session_write_frame(sink, frame, SWITCH_IO_FLAG_NONE, 0) == SWITCH_STATUS_SUCCESS);
 						}
-						if (switch_test_flag(frame, SFF_CNG)) continue;
+						if (switch_test_flag(frame, SFF_CNG)) {
+							unknown_cng += frame->payload == 8;
+							continue;
+						}
 						fst_requires(frame->codec && frame->codec->implementation);
-						fst_xcheck(frame->payload == payload && !strcasecmp(frame->codec->implementation->iananame, expected),
-								switch_core_sprintf(fst_pool, "phase %d: payload %d returned with %s decoder, expected %s for payload %d",
-								phase, frame->payload, frame->codec->implementation->iananame, expected, payload));
+						iananame = frame->codec->implementation->iananame;
+						expected = unknown ? "CNG" : frame->payload == 111 ? "OPUS" : frame->payload == 18 ? "G729" : "PCMU";
+						fct_xchk((cases[i].jb_msec || frame->payload == payload) && !strcasecmp(iananame, expected),
+								"case %u phase %d: payload %d returned with %s decoder, expected %s (sent payload %d)",
+								i, phase, frame->payload, iananame, expected, payload);
+						if (last && strcasecmp(last, iananame)) changes++;
+						last = iananame;
 						audio_frames++;
 					}
-					fst_xcheck(audio_frames > 0, switch_core_sprintf(fst_pool, "phase %d: audio must recover after the codec change", phase));
+					if (unknown) {
+						fct_xchk(unknown_cng > 0, "case %u: unnegotiated payload never reached the media layer", i);
+					} else {
+						fct_xchk(audio_frames > 0, "case %u phase %d: audio must recover after the codec change", i, phase);
+					}
+					if (interleaved) {
+						/* Follow one source at a time; do not rebuild the codec per packet. */
+						fct_xchk(changes <= 3, "case %u: interleaved payloads caused %d codec changes in %d packets", i, changes, packets);
+					}
 					fst_check(switch_channel_up_nosig(channel));
 				}
 				opus_test_close(&session);
 				if (sink) {
+					switch_core_session_unset_write_codec(sink);
 					switch_core_codec_destroy(&pcmu);
 					switch_channel_hangup(switch_core_session_get_channel(sink), SWITCH_CAUSE_NORMAL_CLEARING);
 					switch_core_session_rwunlock(sink);

@@ -49,6 +49,8 @@ static void gen_ice(switch_core_session_t *session, switch_media_type_t type, co
 #define RTCP_MUX
 #define MAX_CODEC_CHECK_FRAMES 50//x:mod_sofia.h
 #define MAX_MISMATCH_FRAMES 5//x:mod_sofia.h
+/* Packets to wait after an RTP payload type change before following another one. */
+#define PAYLOAD_SWITCH_HOLD_FRAMES 10
 #define type2str(type) type == SWITCH_MEDIA_TYPE_VIDEO ? "video" : (type == SWITCH_MEDIA_TYPE_AUDIO ? "audio" : "text")
 #define VIDEO_REFRESH_FREQ 1000000
 
@@ -129,6 +131,7 @@ struct switch_rtp_engine_s {
 	uint32_t check_frames;
 	uint32_t mismatch_count;
 	uint32_t last_codec_ms;
+	uint32_t payload_switch_hold;
 	uint8_t codec_reinvites;
 	uint32_t max_missed_packets;
 	uint32_t max_missed_hold_packets;
@@ -2760,6 +2763,82 @@ static void check_media_timeout_params(switch_core_session_t *session, switch_rt
 	}
 }
 
+/* Re-initialize the engine codec from cur_payload_map. */
+static switch_status_t media_reset_engine_codec(switch_core_session_t *session, switch_media_handle_t *smh,
+												switch_rtp_engine_t *engine, switch_media_type_t type)
+{
+	const char *val;
+	int rtp_timeout_sec = 0;
+	int rtp_hold_timeout_sec = 0;
+
+	engine->reset_codec = 0;
+
+	if (switch_rtp_ready(engine->rtp_session)) {
+
+		check_media_timeout_params(session, engine);
+
+		if (type == SWITCH_MEDIA_TYPE_VIDEO) {
+			switch_core_media_set_video_codec(session, 1);
+		} else {
+
+			if (switch_core_media_set_codec(session, 1, smh->mparams->codec_flags) != SWITCH_STATUS_SUCCESS) {
+				return SWITCH_STATUS_GENERR;
+			}
+		}
+
+		if (type == SWITCH_MEDIA_TYPE_AUDIO && engine->read_impl.samples_per_second) {
+			if ((val = switch_channel_get_variable(session->channel, "rtp_timeout_sec"))) {
+				int v = atoi(val);
+				if (v >= 0) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+									  "rtp_timeout_sec deprecated use media_timeout variable.\n"); 
+					rtp_timeout_sec = v;
+				}
+			}
+
+			if ((val = switch_channel_get_variable(session->channel, "rtp_hold_timeout_sec"))) {
+				int v = atoi(val);
+				if (v >= 0) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+									  "rtp_hold_timeout_sec deprecated use media_timeout variable.\n"); 
+					rtp_hold_timeout_sec = v;
+				}
+			}
+
+			if (rtp_timeout_sec) {
+				engine->max_missed_packets = (engine->read_impl.samples_per_second * rtp_timeout_sec) /
+					engine->read_impl.samples_per_packet;
+
+				switch_rtp_set_max_missed_packets(engine->rtp_session, engine->max_missed_packets);
+				if (!rtp_hold_timeout_sec) {
+					rtp_hold_timeout_sec = rtp_timeout_sec * 10;
+				}
+			}
+
+			if (rtp_hold_timeout_sec) {
+				engine->max_missed_hold_packets = (engine->read_impl.samples_per_second * rtp_hold_timeout_sec) /
+					engine->read_impl.samples_per_packet;
+			}
+		}
+	}
+
+	check_jb(session, NULL, 0, 0, SWITCH_FALSE);
+
+	engine->check_frames = 0;
+	engine->last_ts = 0;
+	engine->last_seq = 0;
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+static void media_read_cng(switch_rtp_engine_t *engine, switch_frame_t **frame)
+{
+	*frame = &engine->read_frame;
+	switch_set_flag((*frame), SFF_CNG);
+	(*frame)->datalen = engine->read_impl.encoded_bytes_per_packet;
+	memset((*frame)->data, 0, (*frame)->datalen);
+}
+
 SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session_t *session, switch_frame_t **frame,
 															 switch_io_flag_t flags, int stream_id, switch_media_type_t type)
 {
@@ -2820,10 +2899,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 			if (status == SWITCH_STATUS_TIMEOUT) {
 
 				if (switch_channel_get_variable(session->channel, "execute_on_media_timeout")) {
-					*frame = &engine->read_frame;
-					switch_set_flag((*frame), SFF_CNG);
-					(*frame)->datalen = engine->read_impl.encoded_bytes_per_packet;
-					memset((*frame)->data, 0, (*frame)->datalen);
+					media_read_cng(engine, frame);
 					switch_channel_execute_on(session->channel, "execute_on_media_timeout");
 					switch_goto_status(SWITCH_STATUS_SUCCESS, end);
 				}
@@ -2860,70 +2936,12 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 			}
 		}
 
-	reset_codec:
 		/* re-set codec if necessary */
 		if (type != SWITCH_MEDIA_TYPE_TEXT && engine->reset_codec > 0) {
-			const char *val;
-			int rtp_timeout_sec = 0;
-			int rtp_hold_timeout_sec = 0;
-
-			engine->reset_codec = 0;
-
-			if (switch_rtp_ready(engine->rtp_session)) {
-
-				check_media_timeout_params(session, engine);
-
-				if (type == SWITCH_MEDIA_TYPE_VIDEO) {
-					switch_core_media_set_video_codec(session, 1);
-				} else {
-
-					if (switch_core_media_set_codec(session, 1, smh->mparams->codec_flags) != SWITCH_STATUS_SUCCESS) {
-						*frame = NULL;
-						switch_goto_status(SWITCH_STATUS_GENERR, end);
-					}
-				}
-
-				if (type == SWITCH_MEDIA_TYPE_AUDIO && engine->read_impl.samples_per_second) {
-					if ((val = switch_channel_get_variable(session->channel, "rtp_timeout_sec"))) {
-						int v = atoi(val);
-						if (v >= 0) {
-							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-											  "rtp_timeout_sec deprecated use media_timeout variable.\n"); 
-							rtp_timeout_sec = v;
-						}
-					}
-
-					if ((val = switch_channel_get_variable(session->channel, "rtp_hold_timeout_sec"))) {
-						int v = atoi(val);
-						if (v >= 0) {
-							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-											  "rtp_hold_timeout_sec deprecated use media_timeout variable.\n"); 
-							rtp_hold_timeout_sec = v;
-						}
-					}
-
-					if (rtp_timeout_sec) {
-						engine->max_missed_packets = (engine->read_impl.samples_per_second * rtp_timeout_sec) /
-							engine->read_impl.samples_per_packet;
-
-						switch_rtp_set_max_missed_packets(engine->rtp_session, engine->max_missed_packets);
-						if (!rtp_hold_timeout_sec) {
-							rtp_hold_timeout_sec = rtp_timeout_sec * 10;
-						}
-					}
-
-					if (rtp_hold_timeout_sec) {
-						engine->max_missed_hold_packets = (engine->read_impl.samples_per_second * rtp_hold_timeout_sec) /
-							engine->read_impl.samples_per_packet;
-					}
-				}
+			if (media_reset_engine_codec(session, smh, engine, type) != SWITCH_STATUS_SUCCESS) {
+				*frame = NULL;
+				switch_goto_status(SWITCH_STATUS_GENERR, end);
 			}
-
-			check_jb(session, NULL, 0, 0, SWITCH_FALSE);
-
-			engine->check_frames = 0;
-			engine->last_ts = 0;
-			engine->last_seq = 0;
 
 			do_cng = 1;
 		}
@@ -2931,10 +2949,7 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 
 		if (do_cng) {
 			/* return CNG for now */
-			*frame = &engine->read_frame;
-			switch_set_flag((*frame), SFF_CNG);
-			(*frame)->datalen = engine->read_impl.encoded_bytes_per_packet;
-			memset((*frame)->data, 0, (*frame)->datalen);
+			media_read_cng(engine, frame);
 			switch_goto_status(SWITCH_STATUS_SUCCESS, end);
 		}
 
@@ -3172,6 +3187,10 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 
 				/* autofix payload type */
 
+				if (engine->payload_switch_hold && !switch_test_flag((&engine->read_frame), SFF_PLC)) {
+					engine->payload_switch_hold--;
+				}
+
 				if (!engine->reset_codec &&
 					engine->codec_negotiated &&
 					(!smh->mparams->cng_pt || engine->read_frame.payload != smh->mparams->cng_pt) &&
@@ -3194,28 +3213,46 @@ SWITCH_DECLARE(switch_status_t) switch_core_media_read_frame(switch_core_session
 					switch_mutex_lock(smh->sdp_mutex);
 					for (pmap = engine->payload_map; pmap; pmap = pmap->next) {
 						if (engine->read_frame.payload == pmap->recv_pt && pmap->negotiated) {
-							engine->cur_payload_map = pmap;
-							engine->cur_payload_map->current = 1;
-							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-											  "Changing current codec to %s (payload type %d).\n",
-											  pmap->iananame, pmap->pt);
-
-							/* mark to re-set codec */
-							engine->reset_codec = 1;
 							break;
 						}
+					}
+
+					if (pmap && !engine->payload_switch_hold) {
+						engine->cur_payload_map = pmap;
+						engine->cur_payload_map->current = 1;
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+										  "Changing current codec to %s (payload type %d).\n",
+										  pmap->iananame, pmap->pt);
+
+						/* mark to re-set codec */
+						engine->reset_codec = 1;
 					}
 					switch_mutex_unlock(smh->sdp_mutex);
 
 					if (engine->reset_codec) {
-						/* Reset before returning this packet. Otherwise it retains
-						 * the previous decoder and a decode error can end the bridge.
-						 * The reset path returns CNG for the transition packet. */
-						goto reset_codec;
-					} else {
+						/* Reset now so the new codec, not the previous one, decodes this packet. */
+						if (media_reset_engine_codec(session, smh, engine, type) != SWITCH_STATUS_SUCCESS) {
+							*frame = NULL;
+							switch_goto_status(SWITCH_STATUS_GENERR, end);
+						}
+						engine->payload_switch_hold = PAYLOAD_SWITCH_HOLD_FRAMES;
+					} else if (!pmap && ((engine->rtp_bugs | smh->mparams->manual_rtp_bugs) & RTP_BUG_ACCEPT_ANY_PAYLOAD)) {
 						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
 										  "Could not change to payload type %d, ignoring...\n",
 										  (int) engine->read_frame.payload);
+					} else {
+						/* The current codec cannot decode this payload. */
+						if (pmap) {
+							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+											  "Codec changed recently, dropping payload type %d\n",
+											  (int) engine->read_frame.payload);
+						} else {
+							switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+											  "Could not change to payload type %d, dropping...\n",
+											  (int) engine->read_frame.payload);
+						}
+						media_read_cng(engine, frame);
+						switch_goto_status(SWITCH_STATUS_SUCCESS, end);
 					}
 				}
 
