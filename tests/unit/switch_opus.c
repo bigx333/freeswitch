@@ -132,7 +132,8 @@ static switch_status_t opus_test_send_audio(switch_socket_t *peer, switch_sockad
 		uint8_t payload, uint16_t seq, uint32_t timestamp)
 {
 	unsigned char packet[172];
-	unsigned char opus_silence[] = { 0xf8, 0xff, 0xfe };
+	/* A 20 ms Opus frame padded to 40 bytes, a size the CBR timing check also inspects. */
+	unsigned char opus_silence[40] = { 0xfb, 0x41, 0x23, 0xff, 0xfe };
 	switch_size_t len = 12;
 
 	rtp_test_header(packet, payload, seq, timestamp);
@@ -219,6 +220,7 @@ FST_CORE_BEGIN("./conf")
 				uint8_t proceed = 0;
 				uint16_t seq = 100;
 				uint32_t timestamp = 1000;
+				uint8_t last_payload = 111;
 				int phase, packet;
 				char *sdp;
 
@@ -229,6 +231,8 @@ FST_CORE_BEGIN("./conf")
 
 				fst_requires(rtp_test_peer(fst_pool, &peer, &peer_addr) == SWITCH_STATUS_SUCCESS);
 				fst_requires(opus_test_session("opus@16000h,PCMU,G729", &session) == SWITCH_STATUS_SUCCESS);
+				/* Sofia profiles enable timing correction by default. */
+				switch_media_handle_set_media_flag(switch_core_session_get_media_handle(session), SCMF_AUTOFIX_TIMING);
 				channel = switch_core_session_get_channel(session);
 				sdp = switch_core_session_sprintf(session,
 						"v=0\r\no=test 1 1 IN IP4 127.0.0.1\r\ns=test\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"
@@ -279,6 +283,11 @@ FST_CORE_BEGIN("./conf")
 						const char *expected, *iananame;
 						switch_frame_t *frame = NULL;
 
+						if (payload == 111 && last_payload != 111) {
+							/* The Yealink in the capture restarts the Opus clock when it switches back. */
+							timestamp = 960;
+						}
+						last_payload = payload;
 						fst_requires(opus_test_send_audio(peer, rtp_addr, payload, seq++, timestamp) == SWITCH_STATUS_SUCCESS);
 						timestamp += payload == 111 ? 960 : 160;
 						fst_requires(switch_core_media_read_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0,
